@@ -6,7 +6,8 @@ use regex::Regex;
 use super::{
     comment_strip_iter::CommentReplaceExt,
     parse_imports::{parse_imports, substitute_identifiers},
-    ComposerErrorInner, ImportDefWithOffset, ShaderDefValue,
+    ComposerErrorInner, ExtensionDefWithOffset, ExtensionDefinition, ImportDefWithOffset,
+    ShaderDefValue,
 };
 
 #[derive(Debug)]
@@ -21,6 +22,7 @@ pub struct Preprocessor {
     def_regex_delimited: Regex,
     import_regex: Regex,
     define_import_path_regex: Regex,
+    extension_regex: Regex,
     define_shader_def_regex: Regex,
 }
 
@@ -40,6 +42,7 @@ impl Default for Preprocessor {
             def_regex_delimited: Regex::new(r"#\s*\{([\w|\d|_]+)\}").unwrap(),
             import_regex: Regex::new(r"^\s*#\s*import\s").unwrap(),
             define_import_path_regex: Regex::new(r"^\s*#\s*define_import_path\s+([^\s]+)").unwrap(),
+            extension_regex: Regex::new(r"^\s*#\s*extend\s+([^\s]+)").unwrap(),
             define_shader_def_regex: Regex::new(r"^\s*#\s*define\s+([\w|\d|_]+)\s*([-\w|\d]+)?")
                 .unwrap(),
         }
@@ -50,6 +53,7 @@ impl Default for Preprocessor {
 pub struct PreprocessorMetaData {
     pub name: Option<String>,
     pub imports: Vec<ImportDefWithOffset>,
+    pub extensions: Vec<ExtensionDefWithOffset>,
     pub defines: HashMap<String, ShaderDefValue>,
     pub effective_defs: HashSet<String>,
 }
@@ -130,6 +134,7 @@ impl Scope {
 pub struct PreprocessOutput {
     pub preprocessed_source: String,
     pub imports: Vec<ImportDefWithOffset>,
+    pub extensions: Vec<ExtensionDefWithOffset>,
 }
 
 impl Preprocessor {
@@ -235,6 +240,7 @@ impl Preprocessor {
         shader_defs: &HashMap<String, ShaderDefValue>,
     ) -> Result<PreprocessOutput, ComposerErrorInner> {
         let mut declared_imports = IndexMap::new();
+        let mut extensions = Vec::new();
         let mut used_imports = IndexMap::new();
         let mut scope = Scope::new();
         let mut final_string = String::new();
@@ -298,6 +304,12 @@ impl Preprocessor {
                         },
                     )?;
                     output = true;
+                } else if let Some(cap) = self.extension_regex.captures(&line) {
+                    let extension = cap.get(1).unwrap().as_str().to_string();
+                    extensions.push(ExtensionDefWithOffset {
+                        definition: ExtensionDefinition(extension),
+                        offset,
+                    });
                 } else {
                     let replaced_lines = [original_line, &line].map(|input| {
                         let mut output = input.to_string();
@@ -370,6 +382,7 @@ impl Preprocessor {
         Ok(PreprocessOutput {
             preprocessed_source: final_string,
             imports: used_imports.into_values().collect(),
+            extensions,
         })
     }
 
@@ -385,7 +398,7 @@ impl Preprocessor {
         let mut offset = 0;
         let mut defines = HashMap::default();
         let mut effective_defs = HashSet::default();
-
+        let mut extensions = Vec::new();
         let mut lines = shader_str.lines();
         let mut lines = lines.replace_comments().peekable();
 
@@ -431,6 +444,11 @@ impl Preprocessor {
                         )
                     },
                 )?;
+            } else if let Some(cap) = self.extension_regex.captures(&line) {
+                extensions.push(ExtensionDefWithOffset {
+                    definition: ExtensionDefinition(cap.get(1).unwrap().as_str().to_string()),
+                    offset,
+                });
             } else if let Some(cap) = self.define_import_path_regex.captures(&line) {
                 name = Some(cap.get(1).unwrap().as_str().to_string());
             } else if let Some(cap) = self.define_shader_def_regex.captures(&line) {
@@ -475,6 +493,7 @@ impl Preprocessor {
         Ok(PreprocessorMetaData {
             name,
             imports: used_imports.into_values().collect(),
+            extensions,
             defines,
             effective_defs,
         })

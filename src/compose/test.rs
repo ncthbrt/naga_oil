@@ -441,6 +441,54 @@ mod test {
 
     #[cfg(feature = "test_shader")]
     #[test]
+    fn apply_extend() {
+        let mut composer = Composer::default();
+
+        composer
+            .add_composable_module(ComposableModuleDescriptor {
+                source: include_str!("tests/extend/top.wgsl"),
+                file_path: "tests/extend/top.wgsl",
+                ..Default::default()
+            })
+            .unwrap();
+
+        composer
+            .add_composable_module(ComposableModuleDescriptor {
+                source: include_str!("tests/extend/middle.wgsl"),
+                file_path: "tests/extend/middle.wgsl",
+                ..Default::default()
+            })
+            .unwrap();
+
+        composer
+            .add_composable_module(ComposableModuleDescriptor {
+                source: include_str!("tests/extend/imported_entrypoint.wgsl"),
+                file_path: "tests/extend/imported_entrypoint.wgsl",
+                ..Default::default()
+            })
+            .unwrap();
+
+        let module = composer
+            .make_naga_module(NagaModuleDescriptor {
+                source: include_str!("tests/extend/true_entrypoint.wgsl"),
+                file_path: "tests/extend/true_entrypoint.wgsl",
+                ..Default::default()
+            })
+            .unwrap();
+
+        let info = composer.create_validator().validate(&module).unwrap();
+        let wgsl = naga::back::wgsl::write_string(
+            &module,
+            &info,
+            naga::back::wgsl::WriterFlags::EXPLICIT_TYPES,
+        )
+        .unwrap();
+        // todo test properly - the redirect returns the functions in random order so can't rely on string repr
+        println!("{wgsl}");
+    }
+
+    #[cfg(feature = "test_shader")]
+    #[test]
     fn apply_mod_override() {
         let mut composer = Composer::default();
 

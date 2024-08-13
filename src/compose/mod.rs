@@ -127,7 +127,7 @@ use indexmap::IndexMap;
 ///
 /// codespan reporting for errors is available using the error `emit_to_string` method. this requires validation to be enabled, which is true by default. `Composer::non_validating()` produces a non-validating composer that is not able to give accurate error reporting.
 ///
-use naga::EntryPoint;
+use naga::{EntryPoint, Span};
 use regex::Regex;
 use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use tracing::{debug, trace};
@@ -203,17 +203,27 @@ impl ShaderDefValue {
 pub struct OwnedShaderDefs(BTreeMap<String, ShaderDefValue>);
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
-struct ModuleKey(OwnedShaderDefs);
+struct ModuleKey {
+    defs: OwnedShaderDefs,
+    base_module_name: Option<String>,
+}
 
 impl ModuleKey {
-    fn from_members(key: &HashMap<String, ShaderDefValue>, universe: &[String]) -> Self {
+    fn from_members(
+        key: &HashMap<String, ShaderDefValue>,
+        universe: &[String],
+        base_module_name: Option<String>,
+    ) -> Self {
         let mut acc = OwnedShaderDefs::default();
         for item in universe {
             if let Some(value) = key.get(item) {
                 acc.0.insert(item.to_owned(), *value);
             }
         }
-        ModuleKey(acc)
+        ModuleKey {
+            defs: acc,
+            base_module_name,
+        }
     }
 }
 
@@ -224,6 +234,8 @@ pub struct ComposableModule {
     pub decorated_name: String,
     // module names required as imports, optionally with a list of items to import
     pub imports: Vec<ImportDefinition>,
+    // module names required as extensions
+    pub extensions: Vec<ExtensionDefinition>,
     // types exported
     pub owned_types: HashSet<String>,
     // constants exported
@@ -264,9 +276,11 @@ pub struct ComposableModuleDefinition {
     effective_defs: Vec<String>,
     // full list of possible imports (regardless of shader_def configuration)
     all_imports: HashSet<String>,
+    // full list of possible extensions (regardless of shader_def configuration)
+    all_extensions: HashSet<String>,
     // additional imports to add (as though they were included in the source after any other imports)
     additional_imports: Vec<ImportDefinition>,
-    // built composable modules for a given set of shader defs
+    // built composable modules for a given set of shader defs and base_module
     modules: HashMap<ModuleKey, ComposableModule>,
     // used in spans when this module is included
     module_index: usize,
@@ -278,20 +292,26 @@ impl ComposableModuleDefinition {
     fn get_module(
         &self,
         shader_defs: &HashMap<String, ShaderDefValue>,
+        base_module_name: Option<String>,
     ) -> Option<&ComposableModule> {
-        self.modules
-            .get(&ModuleKey::from_members(shader_defs, &self.effective_defs))
+        self.modules.get(&ModuleKey::from_members(
+            shader_defs,
+            &self.effective_defs,
+            base_module_name,
+        ))
     }
 
     fn insert_module(
         &mut self,
         shader_defs: &HashMap<String, ShaderDefValue>,
+        base_module_name: Option<String>,
         module: ComposableModule,
     ) -> &ComposableModule {
-        match self
-            .modules
-            .entry(ModuleKey::from_members(shader_defs, &self.effective_defs))
-        {
+        match self.modules.entry(ModuleKey::from_members(
+            shader_defs,
+            &self.effective_defs,
+            base_module_name,
+        )) {
             Entry::Occupied(_) => panic!("entry already populated"),
             Entry::Vacant(v) => v.insert(module),
         }
@@ -304,9 +324,18 @@ pub struct ImportDefinition {
     pub items: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtensionDefinition(String);
+
 #[derive(Debug, Clone)]
 pub struct ImportDefWithOffset {
     definition: ImportDefinition,
+    offset: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExtensionDefWithOffset {
+    definition: ExtensionDefinition,
     offset: usize,
 }
 
@@ -573,10 +602,12 @@ impl Composer {
     // build naga module for a given shader_def configuration. builds a minimal self-contained module built against headers for imports
     fn create_module_ir(
         &self,
+        base_module_name: Option<String>,
         name: &str,
         source: String,
         language: ShaderLanguage,
         imports: &[ImportDefinition],
+        extensions: &[ExtensionDefinition],
         shader_defs: &HashMap<String, ShaderDefValue>,
     ) -> Result<IrBuildResult, ComposerError> {
         debug!("creating IR for {} with defs: {:?}", name, shader_defs);
@@ -590,6 +621,47 @@ impl Composer {
         let mut override_functions: IndexMap<String, Vec<String>> = IndexMap::default();
         let mut added_imports: HashSet<String> = HashSet::new();
         let mut header_module = DerivedModule::default();
+
+        for extension in extensions {
+            let base_module_name = base_module_name.clone().unwrap_or(name.to_string());
+            // add to header module
+            self.add_extension(
+                base_module_name.clone(),
+                &mut header_module,
+                extension,
+                shader_defs,
+                true,
+                &mut added_imports,
+            );
+
+            // // we must have ensured these exist with Composer::ensure_imports_and_extensiohns()
+            trace!("looking for {}", extension.0);
+            let extend_module_set = self.module_sets.get(&extension.0).unwrap();
+            trace!("with defs {:?}", shader_defs);
+            let module = extend_module_set
+                .get_module(shader_defs, Some(base_module_name.clone()))
+                .unwrap();
+            trace!("ok");
+
+            if !module.override_functions.is_empty() {
+                for (original, replacements) in &module.override_functions {
+                    match override_functions.entry(original.clone()) {
+                        indexmap::map::Entry::Occupied(o) => {
+                            let existing = o.into_mut();
+                            let new_replacements: Vec<_> = replacements
+                                .iter()
+                                .filter(|rep| !existing.contains(rep))
+                                .cloned()
+                                .collect();
+                            existing.extend(new_replacements);
+                        }
+                        indexmap::map::Entry::Vacant(v) => {
+                            v.insert(replacements.clone());
+                        }
+                    }
+                }
+            }
+        }
 
         for import in imports {
             if added_imports.contains(&import.import) {
@@ -608,7 +680,7 @@ impl Composer {
             trace!("looking for {}", import.import);
             let import_module_set = self.module_sets.get(&import.import).unwrap();
             trace!("with defs {:?}", shader_defs);
-            let module = import_module_set.get_module(shader_defs).unwrap();
+            let module = import_module_set.get_module(shader_defs, None).unwrap();
             trace!("ok");
 
             // gather overrides
@@ -806,22 +878,22 @@ impl Composer {
             }
         }
 
-        let recompiled_fns: HashSet<_> = recompiled
-            .functions
-            .iter()
-            .flat_map(|(_, c)| c.name.as_deref())
-            .filter(|name| name.ends_with(module_decoration))
-            .collect();
-        for (h, f) in source_ir.functions.iter() {
-            if let Some(name) = &f.name {
-                if name.ends_with(module_decoration) && !recompiled_fns.contains(name.as_str()) {
-                    return Err(ComposerErrorInner::InvalidIdentifier {
-                        original: name.clone(),
-                        at: source_ir.functions.get_span(h),
-                    });
-                }
-            }
-        }
+        // let recompiled_fns: HashSet<_> = recompiled
+        //     .functions
+        //     .iter()
+        //     .flat_map(|(_, c)| c.name.as_deref())
+        //     .filter(|name| name.ends_with(module_decoration))
+        //     .collect();
+        // for (h, f) in source_ir.functions.iter() {
+        //     if let Some(name) = &f.name {
+        //         if name.ends_with(module_decoration) && !recompiled_fns.contains(name.as_str()) {
+        //             return Err(ComposerErrorInner::InvalidIdentifier {
+        //                 original: name.clone(),
+        //                 at: source_ir.functions.get_span(h),
+        //             });
+        //         }
+        //     }
+        // }
 
         Ok(())
     }
@@ -835,16 +907,23 @@ impl Composer {
         &mut self,
         module_definition: &ComposableModuleDefinition,
         module_decoration: String,
+        base_module_name: Option<String>,
         shader_defs: &HashMap<String, ShaderDefValue>,
         create_headers: bool,
         demote_entrypoints: bool,
         source: &str,
         imports: Vec<ImportDefWithOffset>,
+        extensions: Vec<ExtensionDefWithOffset>,
     ) -> Result<ComposableModule, ComposerError> {
         let mut imports: Vec<_> = imports
             .into_iter()
             .map(|import_with_offset| import_with_offset.definition)
             .collect();
+        let extensions: Vec<_> = extensions
+            .into_iter()
+            .map(|extension_with_offset| extension_with_offset.definition)
+            .collect();
+
         imports.extend(module_definition.additional_imports.to_vec());
 
         trace!(
@@ -910,7 +989,9 @@ impl Composer {
                                 ));
                             }
                             Some(module_set) => {
-                                let module = module_set.get_module(shader_defs).unwrap();
+                                let module = module_set
+                                    .get_module(shader_defs, base_module_name.clone())
+                                    .unwrap();
                                 if !module.virtual_functions.contains(&target_function) {
                                     let pos = cap.get(2).unwrap().start();
                                     override_error =
@@ -968,10 +1049,12 @@ impl Composer {
             start_offset,
             mut override_functions,
         } = self.create_module_ir(
+            base_module_name.clone(),
             &module_definition.name,
             source,
             module_definition.language,
             &imports,
+            &extensions,
             shader_defs,
         )?;
 
@@ -1012,6 +1095,8 @@ impl Composer {
             if let Some(name) = po.name.as_mut() {
                 if !name.contains(DECORATION_PRE) {
                     *name = format!("{name}{module_decoration}");
+                }
+                if name.ends_with(&module_decoration) {
                     owned_pipeline_overrides.insert(name.clone(), h);
                 }
             }
@@ -1022,7 +1107,8 @@ impl Composer {
             if let Some(name) = gv.name.as_mut() {
                 if !name.contains(DECORATION_PRE) {
                     *name = format!("{name}{module_decoration}");
-
+                }
+                if name.ends_with(&module_decoration) {
                     owned_vars.insert(name.clone(), h);
                 }
             }
@@ -1033,7 +1119,8 @@ impl Composer {
             if let Some(name) = f.name.as_mut() {
                 if !name.contains(DECORATION_PRE) {
                     *name = format!("{name}{module_decoration}");
-
+                }
+                if name.ends_with(&module_decoration) {
                     // create dummy header function
                     let header_function = naga::Function {
                         name: Some(name.clone()),
@@ -1084,7 +1171,7 @@ impl Composer {
 
                 owned_functions.insert(ep.function.name.clone().unwrap(), (None, header_function));
             }
-        };
+        }
 
         let mut module_builder = DerivedModule::default();
         let mut header_builder = DerivedModule::default();
@@ -1102,6 +1189,9 @@ impl Composer {
                     // copy and rename types
                     module_builder.rename_type(&h, Some(name.clone()));
                     header_builder.rename_type(&h, Some(name));
+                    continue;
+                } else if name.ends_with(&module_decoration) {
+                    owned_types.insert(name.clone());
                     continue;
                 }
             }
@@ -1138,6 +1228,7 @@ impl Composer {
             let span = source_ir.functions.get_span(h_f);
             module_builder.import_function(f, span);
         }
+
         // // including entry points as vanilla functions if required
         if demote_entrypoints {
             for ep in &source_ir.entry_points {
@@ -1159,9 +1250,12 @@ impl Composer {
                 module_builder.import_function(&f, naga::Span::UNDEFINED);
                 // todo figure out how to get span info for entrypoints
             }
+        } else {
+            for ep in &source_ir.entry_points {
+                header_builder.import_entrypoint(ep);
+            }
         }
-
-        let module_ir = module_builder.into_module_with_entrypoints();
+        let module_ir = module_builder.into_module_with_all_entrypoints();
         let mut header_ir: naga::Module = header_builder.into();
 
         if self.validate && create_headers {
@@ -1190,6 +1284,7 @@ impl Composer {
             decorated_name: module_decoration,
             imports,
             owned_types,
+            extensions,
             owned_constants: owned_constants.into_keys().collect(),
             owned_vars: owned_vars.into_keys().collect(),
             owned_functions: owned_functions.into_keys().collect(),
@@ -1210,6 +1305,7 @@ impl Composer {
         items: Option<&Vec<String>>,
         span_offset: usize,
         header: bool,
+        include_entrypoints: bool,
     ) {
         let items: Option<HashSet<String>> = items.map(|items| {
             items
@@ -1219,9 +1315,10 @@ impl Composer {
         });
         let items = items.as_ref();
 
-        let source_ir = match header {
-            true => &composable.header_ir,
-            false => &composable.module_ir,
+        let source_ir = if header {
+            &composable.header_ir
+        } else {
+            &composable.module_ir
         };
 
         derived.set_shader_source(source_ir, span_offset);
@@ -1232,6 +1329,14 @@ impl Composer {
                     && items.map_or(true, |items| items.contains(name))
                 {
                     derived.import_type(&h);
+                }
+            }
+        }
+
+        if include_entrypoints {
+            for ep in source_ir.entry_points.iter() {
+                if ep.name != "dummy_module_entry_point" {
+                    derived.import_entrypoint(&ep);
                 }
             }
         }
@@ -1299,10 +1404,21 @@ impl Composer {
         }
 
         let import_module_set = self.module_sets.get(&import.import).unwrap();
-        let module = import_module_set.get_module(shader_defs).unwrap();
+        let module = import_module_set.get_module(shader_defs, None).unwrap();
 
         for import in &module.imports {
             self.add_import(derived, import, shader_defs, header, already_added);
+        }
+
+        for extension in &module.extensions {
+            self.add_extension(
+                import.import.to_string(),
+                derived,
+                extension,
+                shader_defs,
+                header,
+                already_added,
+            );
         }
 
         Self::add_composable_data(
@@ -1311,17 +1427,61 @@ impl Composer {
             Some(&import.items),
             import_module_set.module_index << SPAN_SHIFT,
             header,
+            false,
         );
     }
 
-    fn ensure_import(
+    // add an extension (and recursive extensions) into a derived module
+    fn add_extension<'a>(
+        &'a self,
+        base_module_name: String,
+        derived: &mut DerivedModule<'a>,
+        ExtensionDefinition(extension): &ExtensionDefinition,
+        shader_defs: &HashMap<String, ShaderDefValue>,
+        header: bool,
+        import_already_added: &mut HashSet<String>,
+    ) {
+        let extension_module_set = self.module_sets.get(extension).unwrap();
+        let module = extension_module_set
+            .get_module(shader_defs, Some(base_module_name.clone()))
+            .unwrap();
+
+        for import in &module.imports {
+            self.add_import(derived, import, shader_defs, header, import_already_added);
+        }
+
+        for extension in &module.extensions {
+            self.add_extension(
+                base_module_name.clone(),
+                derived,
+                extension,
+                shader_defs,
+                header,
+                import_already_added,
+            );
+        }
+
+        Self::add_composable_data(
+            derived,
+            module,
+            None,
+            extension_module_set.module_index << SPAN_SHIFT,
+            header,
+            true,
+        );
+    }
+
+    fn ensure_import_and_extension(
         &mut self,
         module_set: &ComposableModuleDefinition,
         shader_defs: &HashMap<String, ShaderDefValue>,
+        base_module_name: Option<String>,
+        from_root: bool,
     ) -> Result<ComposableModule, ComposerError> {
         let PreprocessOutput {
             preprocessed_source,
             imports,
+            extensions,
         } = self
             .preprocessor
             .preprocess(&module_set.sanitized_source, shader_defs)
@@ -1336,15 +1496,29 @@ impl Composer {
 
         self.ensure_imports(imports.iter().map(|import| &import.definition), shader_defs)?;
         self.ensure_imports(&module_set.additional_imports, shader_defs)?;
+        self.ensure_extensions(
+            base_module_name.clone().unwrap_or(module_set.name.clone()),
+            extensions.iter().map(|extension| &extension.definition),
+            shader_defs,
+            from_root,
+        )?;
 
         self.create_composable_module(
             module_set,
-            Self::decorate(&module_set.name),
+            if from_root {
+                "".to_string()
+            } else if let Some(base_module_name) = base_module_name.clone() {
+                Self::decorate(&base_module_name)
+            } else {
+                Self::decorate(&module_set.name.clone())
+            },
+            base_module_name.clone(),
             shader_defs,
             true,
-            true,
+            base_module_name.is_none() || !from_root,
             &preprocessed_source,
             imports,
+            extensions,
         )
     }
 
@@ -1357,7 +1531,7 @@ impl Composer {
         for ImportDefinition { import, .. } in imports.into_iter() {
             // we've already ensured imports exist when they were added
             let module_set = self.module_sets.get(import).unwrap();
-            if module_set.get_module(shader_defs).is_some() {
+            if module_set.get_module(shader_defs, None).is_some() {
                 continue;
             }
 
@@ -1365,9 +1539,49 @@ impl Composer {
             // take the set so we can recurse without borrowing
             let (set_key, mut module_set) = self.module_sets.remove_entry(import).unwrap();
 
-            match self.ensure_import(&module_set, shader_defs) {
+            match self.ensure_import_and_extension(&module_set, shader_defs, None, false) {
                 Ok(module) => {
-                    module_set.insert_module(shader_defs, module);
+                    module_set.insert_module(shader_defs, None, module);
+                    self.module_sets.insert(set_key, module_set);
+                }
+                Err(e) => {
+                    self.module_sets.insert(set_key, module_set);
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // build required ComposableModules for a given set of shader_defs
+    fn ensure_extensions<'a>(
+        &mut self,
+        base_module_name: String,
+        extensions: impl IntoIterator<Item = &'a ExtensionDefinition>,
+        shader_defs: &HashMap<String, ShaderDefValue>,
+        from_root: bool,
+    ) -> Result<(), ComposerError> {
+        for ExtensionDefinition(extension) in extensions.into_iter() {
+            // we've already ensured imports exist when they were added
+            let module_set = self.module_sets.get(extension).unwrap();
+            if module_set
+                .get_module(shader_defs, Some(base_module_name.clone()))
+                .is_some()
+            {
+                continue;
+            }
+            // we need to build the module
+            // take the set so we can recurse without borrowing
+            let (set_key, mut module_set) = self.module_sets.remove_entry(extension).unwrap();
+            match self.ensure_import_and_extension(
+                &module_set,
+                shader_defs,
+                Some(base_module_name.clone()),
+                from_root,
+            ) {
+                Ok(module) => {
+                    module_set.insert_module(shader_defs, Some(base_module_name.clone()), module);
                     self.module_sets.insert(set_key, module_set);
                 }
                 Err(e) => {
@@ -1463,6 +1677,7 @@ impl Composer {
             name: module_name,
             mut imports,
             mut effective_defs,
+            extensions,
             ..
         } = self
             .preprocessor
@@ -1530,6 +1745,31 @@ impl Composer {
             );
         }
 
+        for extension in &extensions {
+            // we require modules already added so that we can capture the shader_defs that may impact us by impacting our dependencies
+            let module_set = self
+                .module_sets
+                .get(&extension.definition.0)
+                .ok_or_else(|| ComposerError {
+                    inner: ComposerErrorInner::ExtensionNotFound(
+                        extension.definition.0.clone(),
+                        extension.offset,
+                    ),
+                    source: ErrSource::Constructing {
+                        path: file_path.to_owned(),
+                        source: substituted_source.to_owned(),
+                        offset: 0,
+                    },
+                })?;
+            effective_defs.extend(module_set.effective_defs.iter().cloned());
+            shader_defs.extend(
+                module_set
+                    .shader_defs
+                    .iter()
+                    .map(|def| (def.0.clone(), *def.1)),
+            );
+        }
+
         // remove defs that are already specified through our imports
         effective_defs.retain(|name| !shader_defs.contains_key(name));
 
@@ -1544,6 +1784,7 @@ impl Composer {
             language,
             effective_defs: effective_defs.into_iter().collect(),
             all_imports: imports.into_iter().map(|id| id.definition.import).collect(),
+            all_extensions: extensions.into_iter().map(|id| id.definition.0).collect(),
             additional_imports,
             shader_defs,
             module_index,
@@ -1566,7 +1807,8 @@ impl Composer {
 
         if self.module_sets.remove(module_name).is_some() {
             dependent_sets.extend(self.module_sets.iter().filter_map(|(dependent_name, set)| {
-                if set.all_imports.contains(module_name) {
+                if set.all_imports.contains(module_name) || set.all_extensions.contains(module_name)
+                {
                     Some(dependent_name.clone())
                 } else {
                     None
@@ -1598,6 +1840,7 @@ impl Composer {
             name,
             defines,
             imports,
+            extensions,
             ..
         } = self
             .preprocessor
@@ -1649,14 +1892,52 @@ impl Composer {
                 });
             }
         }
+        // make sure extensions have been added
+        // and gather additional defs specified at module level
+        for (extension_name, offset) in extensions.iter().map(|id| (&id.definition.0, id.offset)) {
+            if let Some(module_set) = self.module_sets.get(extension_name) {
+                for (def, value) in &module_set.shader_defs {
+                    if let Some(prior_value) = shader_defs.insert(def.clone(), *value) {
+                        if prior_value != *value {
+                            return Err(ComposerError {
+                                inner: ComposerErrorInner::InconsistentShaderDefValue {
+                                    def: def.clone(),
+                                },
+                                source: ErrSource::Constructing {
+                                    path: file_path.to_owned(),
+                                    source: sanitized_source.to_owned(),
+                                    offset: 0,
+                                },
+                            });
+                        }
+                    }
+                }
+            } else {
+                return Err(ComposerError {
+                    inner: ComposerErrorInner::ExtensionNotFound(extension_name.clone(), offset),
+                    source: ErrSource::Constructing {
+                        path: file_path.to_owned(),
+                        source: sanitized_source,
+                        offset: 0,
+                    },
+                });
+            }
+        }
+
         self.ensure_imports(
             imports.iter().map(|import| &import.definition),
             &shader_defs,
         )?;
         self.ensure_imports(additional_imports, &shader_defs)?;
+        self.ensure_extensions(
+            "".to_string(),
+            extensions.iter().map(|extension| &extension.definition),
+            &shader_defs,
+            true,
+        )?;
 
         let definition = ComposableModuleDefinition {
-            name,
+            name: name.clone(),
             sanitized_source: sanitized_source.clone(),
             language: shader_type.into(),
             file_path: file_path.to_owned(),
@@ -1665,6 +1946,7 @@ impl Composer {
             // we don't care about these for creating a top-level module
             effective_defs: Default::default(),
             all_imports: Default::default(),
+            all_extensions: Default::default(),
             shader_defs: Default::default(),
             modules: Default::default(),
         };
@@ -1672,6 +1954,7 @@ impl Composer {
         let PreprocessOutput {
             preprocessed_source,
             imports,
+            extensions,
         } = self
             .preprocessor
             .preprocess(&sanitized_source, &shader_defs)
@@ -1688,11 +1971,13 @@ impl Composer {
             .create_composable_module(
                 &definition,
                 String::from(""),
+                None,
                 &shader_defs,
                 false,
                 false,
                 &preprocessed_source,
                 imports,
+                extensions.clone(),
             )
             .map_err(|e| ComposerError {
                 inner: e.inner,
@@ -1715,8 +2000,18 @@ impl Composer {
                 &mut already_added,
             );
         }
+        for extension in &composable.extensions {
+            self.add_extension(
+                String::from(""),
+                &mut derived,
+                extension,
+                &shader_defs,
+                false,
+                &mut already_added,
+            );
+        }
 
-        Self::add_composable_data(&mut derived, &composable, None, 0, false);
+        Self::add_composable_data(&mut derived, &composable, None, 0, false, false);
 
         let stage = match shader_type {
             #[cfg(feature = "glsl")]
@@ -1728,6 +2023,7 @@ impl Composer {
 
         let mut entry_points = Vec::default();
         derived.set_shader_source(&composable.module_ir, 0);
+
         for ep in &composable.module_ir.entry_points {
             let mapped_func = derived.localize_function(&ep.function);
             entry_points.push(EntryPoint {
@@ -1801,7 +2097,7 @@ impl Composer {
                                         .module_sets
                                         .get(&module_name)
                                         .unwrap()
-                                        .get_module(&shader_defs)
+                                        .get_module(&shader_defs, None)
                                         .unwrap()
                                         .start_offset;
                                     ErrSource::Module {

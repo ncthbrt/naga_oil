@@ -72,6 +72,8 @@ pub enum ComposerErrorInner {
     ImportParseError(String, usize),
     #[error("required import '{0}' not found")]
     ImportNotFound(String, usize),
+    #[error("required extension '{0}' not found")]
+    ExtensionNotFound(String, usize),
     #[error("{0}")]
     WgslParseError(naga::front::wgsl::ParseError),
     #[cfg(feature = "glsl")]
@@ -209,6 +211,10 @@ impl ComposerError {
             ComposerErrorInner::ImportNotFound(msg, pos) => (
                 vec![Label::primary((), *pos..*pos)],
                 vec![format!("missing import '{msg}'")],
+            ),
+            ComposerErrorInner::ExtensionNotFound(msg, pos) => (
+                vec![Label::primary((), *pos..*pos)],
+                vec![format!("missing extension '{msg}'")],
             ),
             ComposerErrorInner::ImportParseError(msg, pos) => (
                 vec![Label::primary((), *pos..*pos)],

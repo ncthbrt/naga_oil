@@ -4,7 +4,7 @@ use naga::{
     FunctionResult, GatherMode, GlobalVariable, Handle, ImageQuery, LocalVariable, Module,
     Override, SampleLevel, Span, Statement, StructMember, SwitchCase, Type, TypeInner, UniqueArena,
 };
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, collections::HashSet, rc::Rc};
 
 #[derive(Debug, Default)]
 pub struct DerivedModule<'a> {
@@ -30,6 +30,7 @@ pub struct DerivedModule<'a> {
     globals: Arena<GlobalVariable>,
     functions: Arena<Function>,
     pipeline_overrides: Arena<Override>,
+    entrypoints: Vec<EntryPoint>,
 }
 
 impl<'a> DerivedModule<'a> {
@@ -772,6 +773,18 @@ impl<'a> DerivedModule<'a> {
         }
     }
 
+    pub fn import_entrypoint(&mut self, entrypoint: &EntryPoint) {
+        let mapped_func = self.localize_function(&entrypoint.function);
+
+        self.entrypoints.push(EntryPoint {
+            name: entrypoint.name.clone(),
+            stage: entrypoint.stage,
+            early_depth_test: entrypoint.early_depth_test,
+            workgroup_size: entrypoint.workgroup_size,
+            function: mapped_func,
+        })
+    }
+
     // import a function defined in the source shader context.
     // func name may be already defined, the returned handle will refer to the new function.
     // the previously defined function will still be valid.
@@ -807,7 +820,8 @@ impl<'a> DerivedModule<'a> {
         self.import_function(func, span)
     }
 
-    pub fn into_module_with_entrypoints(mut self) -> naga::Module {
+    pub fn into_module_with_all_entrypoints(mut self) -> naga::Module {
+        let other_entrypoints = self.entrypoints.clone();
         let entry_points = self
             .shader
             .unwrap()
@@ -820,6 +834,7 @@ impl<'a> DerivedModule<'a> {
                 workgroup_size: ep.workgroup_size,
                 function: self.localize_function(&ep.function),
             })
+            .chain(other_entrypoints)
             .collect();
 
         naga::Module {
@@ -839,8 +854,8 @@ impl<'a> From<DerivedModule<'a>> for naga::Module {
                 .unwrap()
                 .into_inner(),
             functions: derived.functions,
+            entry_points: derived.entrypoints,
             special_types: Default::default(),
-            entry_points: Default::default(),
             overrides: derived.pipeline_overrides,
         }
     }

@@ -221,7 +221,7 @@ impl Redirector {
             }
         }
 
-        Ok(derived.into_module_with_entrypoints())
+        Ok(derived.into_module_with_all_entrypoints())
     }
 }
 
