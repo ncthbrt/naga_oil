@@ -127,9 +127,12 @@ use indexmap::IndexMap;
 ///
 /// codespan reporting for errors is available using the error `emit_to_string` method. this requires validation to be enabled, which is true by default. `Composer::non_validating()` produces a non-validating composer that is not able to give accurate error reporting.
 ///
-use naga::{EntryPoint, Span};
+use naga::EntryPoint;
 use regex::Regex;
-use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
+use std::{
+    collections::{hash_map::Entry, BTreeMap, HashMap, HashSet},
+    str::FromStr,
+};
 use tracing::{debug, trace};
 
 use crate::{
@@ -353,6 +356,7 @@ pub struct Composer {
     undecorate_regex: Regex,
     virtual_fn_regex: Regex,
     override_fn_regex: Regex,
+    override_local_fn_regex: Regex,
     undecorate_override_regex: Regex,
     auto_binding_regex: Regex,
     auto_binding_index: u32,
@@ -403,6 +407,7 @@ impl Default for Composer {
                 .as_str(),
             )
             .unwrap(),
+            override_local_fn_regex: Regex::new(r"(override\s+fn\s+)([^\s]+)(\s*)\(").unwrap(),
             undecorate_override_regex: Regex::new(
                 format!(
                     "{}([A-Z0-9]*){}",
@@ -878,22 +883,22 @@ impl Composer {
             }
         }
 
-        // let recompiled_fns: HashSet<_> = recompiled
-        //     .functions
-        //     .iter()
-        //     .flat_map(|(_, c)| c.name.as_deref())
-        //     .filter(|name| name.ends_with(module_decoration))
-        //     .collect();
-        // for (h, f) in source_ir.functions.iter() {
-        //     if let Some(name) = &f.name {
-        //         if name.ends_with(module_decoration) && !recompiled_fns.contains(name.as_str()) {
-        //             return Err(ComposerErrorInner::InvalidIdentifier {
-        //                 original: name.clone(),
-        //                 at: source_ir.functions.get_span(h),
-        //             });
-        //         }
-        //     }
-        // }
+        let recompiled_fns: HashSet<_> = recompiled
+            .functions
+            .iter()
+            .flat_map(|(_, c)| c.name.as_deref())
+            .filter(|name| name.ends_with(module_decoration))
+            .collect();
+        for (h, f) in source_ir.functions.iter() {
+            if let Some(name) = &f.name {
+                if name.ends_with(module_decoration) && !recompiled_fns.contains(name.as_str()) {
+                    return Err(ComposerErrorInner::InvalidIdentifier {
+                        original: name.clone(),
+                        at: source_ir.functions.get_span(h),
+                    });
+                }
+            }
+        }
 
         Ok(())
     }
@@ -938,7 +943,6 @@ impl Composer {
             .virtual_fn_regex
             .replace_all(source, |cap: &regex::Captures| {
                 let target_function = cap.get(2).unwrap().as_str().to_owned();
-
                 let replacement_str = format!(
                     "{}fn {}{}(",
                     " ".repeat(cap.get(1).unwrap().range().len() - 3),
@@ -951,11 +955,75 @@ impl Composer {
                 replacement_str
             });
 
+        for extension in extensions.iter() {
+            let module_set = self.module_sets.get(&extension.0).unwrap();
+            let module = module_set
+                .get_module(shader_defs, base_module_name.clone())
+                .unwrap();
+            virtual_functions.extend(module.virtual_functions.clone());
+            imports.extend(module.imports.clone());
+        }
+
         // record and rename override functions
         let mut local_override_functions: IndexMap<String, String> = Default::default();
 
         #[cfg(not(feature = "override_any"))]
         let mut override_error = None;
+        let source = self
+            .override_local_fn_regex
+            .replace_all(&source, |cap: &regex::Captures| {
+                let original_string = cap.get(0).unwrap().as_str();
+                if self.override_fn_regex.is_match(original_string) {
+                    return original_string.to_string();
+                }
+                let target_function = cap.get(2).unwrap().as_str().to_owned();
+                let base_name = format!("{}{}", target_function.as_str(), module_decoration);
+                let rename = format!(
+                    "{}{}{}{}",
+                    target_function.as_str(),
+                    DECORATION_OVERRIDE_PRE,
+                    module_decoration,
+                    DECORATION_POST,
+                );
+
+                let replacement_str = format!(
+                    "{}fn {}{}(",
+                    " ".repeat(cap.get(1).unwrap().range().len() - 3),
+                    rename,
+                    " ".repeat(cap.get(3).unwrap().range().len()),
+                );
+
+                #[cfg(not(feature = "override_any"))]
+                {
+                    let wrap_err = |inner: ComposerErrorInner| -> ComposerError {
+                        ComposerError {
+                            inner,
+                            source: ErrSource::Module {
+                                name: module_definition.name.to_owned(),
+                                offset: 0,
+                                defs: shader_defs.clone(),
+                            },
+                        }
+                    };
+
+                    if !virtual_functions.contains(&target_function) {
+                        override_error = Some(wrap_err(ComposerErrorInner::OverrideNotVirtual {
+                            name: target_function.clone(),
+                            pos: cap.get(2).unwrap().start(),
+                        }));
+                    }
+                }
+
+                local_override_functions.insert(rename, base_name);
+
+                replacement_str
+            })
+            .to_string();
+
+        #[cfg(not(feature = "override_any"))]
+        if let Some(err) = override_error {
+            return Err(err);
+        }
 
         let source =
             self.override_fn_regex
@@ -989,9 +1057,7 @@ impl Composer {
                                 ));
                             }
                             Some(module_set) => {
-                                let module = module_set
-                                    .get_module(shader_defs, base_module_name.clone())
-                                    .unwrap();
+                                let module = module_set.get_module(shader_defs, None).unwrap();
                                 if !module.virtual_functions.contains(&target_function) {
                                     let pos = cap.get(2).unwrap().start();
                                     override_error =
@@ -1510,7 +1576,7 @@ impl Composer {
             } else if let Some(base_module_name) = base_module_name.clone() {
                 Self::decorate(&base_module_name)
             } else {
-                Self::decorate(&module_set.name.clone())
+                Self::decorate(&module_set.name)
             },
             base_module_name.clone(),
             shader_defs,
@@ -1971,7 +2037,7 @@ impl Composer {
             .create_composable_module(
                 &definition,
                 String::from(""),
-                None,
+                Some("".to_string()),
                 &shader_defs,
                 false,
                 false,
@@ -2141,6 +2207,7 @@ pub fn get_preprocessor_data(
     if let Ok(PreprocessorMetaData {
         name,
         imports,
+        extensions,
         defines,
         ..
     }) = PREPROCESSOR.get_preprocessor_metadata(source, true)
@@ -2150,6 +2217,10 @@ pub fn get_preprocessor_data(
             imports
                 .into_iter()
                 .map(|import_with_offset| import_with_offset.definition)
+                .chain(extensions.into_iter().map(|x| ImportDefinition {
+                    import: x.definition.0,
+                    ..Default::default()
+                }))
                 .collect(),
             defines,
         )
