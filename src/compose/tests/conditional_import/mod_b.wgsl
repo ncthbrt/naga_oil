@@ -1,3 +1,3 @@
 #define_import_path b
 
-const C: u32 = 2u;
+pub const C: u32 = 2u;

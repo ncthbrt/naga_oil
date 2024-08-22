@@ -1,8 +1,7 @@
 #define_import_path middle
 
-#import mod
+use mod;
 
-override fn mod::inner(arg: f32) -> f32 {
+pub patch fn mod::inner(arg: f32) -> f32 {
     return arg * 3.0;
 }
-

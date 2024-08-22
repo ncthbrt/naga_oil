@@ -1,10 +1,10 @@
 #define_import_path struct_members
 
-struct FineStruct {
+pub struct FineStruct {
     fine: f32,
 }
 
-struct BadStruct {
+pub struct BadStruct {
     also_fine: f32,
     bad_: f32,
 }

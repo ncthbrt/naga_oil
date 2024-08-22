@@ -1,5 +1,5 @@
 #define_import_path struct
 
-struct MyStruct {
+pub struct MyStruct {
     value: f32,
 }

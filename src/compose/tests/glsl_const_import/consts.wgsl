@@ -1,3 +1,3 @@
 #define_import_path common
 
-const my_constant: f32 = 0.5;
+pub const my_constant: f32 = 0.5;

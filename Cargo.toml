@@ -12,7 +12,7 @@ default = ["test_shader", "glsl"]
 # enable tests that need a graphical card
 test_shader = []
 glsl = ["naga/glsl-in", "naga/glsl-out"]
-override_any = []
+patch_any = []
 prune = []
 allow_deprecated = []
 

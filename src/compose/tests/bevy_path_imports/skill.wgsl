@@ -21,11 +21,11 @@
 #import something_unused
 
 @fragment
-fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
+pub fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     return frag(in);
 }
 
 @vertex
-fn vertex(vertex: Vertex) -> VertexOutput {
+pub fn vertex(vertex: Vertex) -> VertexOutput {
     return vert(vertex);
 }

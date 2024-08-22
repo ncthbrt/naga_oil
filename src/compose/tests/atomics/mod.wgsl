@@ -1,8 +1,8 @@
 #define_import_path test_module
 
-var<workgroup> atom: atomic<u32>;
+pub var<workgroup> atom: atomic<u32>;
 
-fn entry_point() -> f32 {
+pub fn entry_point() -> f32 {
     atomicStore(&atom, 1u);          // atom = 1
     var y = atomicLoad(&atom);       // y = 1, atom = 1
     y += atomicAdd(&atom, 2u);       // y = 2, atom = 3

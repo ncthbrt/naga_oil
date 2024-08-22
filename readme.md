@@ -4,6 +4,7 @@ Naga Organised Integration Library (`naga-oil`) is a crate for combining and man
 - `prune` strips shaders down to required parts
 
 and probably less useful externally:
+
 - `derive` allows importing of items from multiple shaders into a single shader
 - `redirect` modifies a shader by substituting function calls and modifying bindings
 
@@ -11,7 +12,8 @@ and probably less useful externally:
 
 the compose module allows construction of shaders from modules (which are themselves shaders).
 
-it does this by treating shaders as modules, and 
+it does this by treating shaders as modules, and
+
 - building each module independently to naga IR
 - creating "header" files for each supported language, which are used to build dependent modules/shaders
 - making final shaders by combining the shader IR with the IR for imported modules
@@ -61,7 +63,7 @@ Some rust-style import syntax is supported, and items can be directly imported u
 
 ```wgsl
 #import my_package::{
-    first_module::{item_one as item, item_two}, 
+    first_module::{item_one as item, item_two},
     second_module::submodule,
 }
 
@@ -70,62 +72,65 @@ fn main() -> f32 {
 }
 ```
 
-`module::self` and `module::*` are not currently supported. 
+`module::self` and `module::*` are not currently supported.
 
 imports can be nested - modules may import other modules, but not recursively. when a new module is added, all its `#import`s must already have been added.
 the same module can be imported multiple times by different modules in the import tree.
 there is no overlap of namespaces, so the same function names (or type, constant, or variable names) may be used in different modules.
 
-note: the final shader will include the required dependencies (bindings, globals, consts, other functions) of any imported items that are used, but will not include the rest of the imported module. 
+note: the final shader will include the required dependencies (bindings, globals, consts, other functions) of any imported items that are used, but will not include the rest of the imported module.
 
 ## overriding functions
 
 virtual functions can be declared with the `virtual` keyword:
+
 ```glsl
-    virtual fn point_light(world_position: vec3<f32>) -> vec3<f32> { ... }
+    pub virtual fn point_light(world_position: vec3<f32>) -> vec3<f32> { ... }
 ```
-virtual functions defined in imported modules can then be overridden using the `override` keyword:
+
+virtual functions defined in imported modules can then be overridden using the `patch` keyword:
 
 ```wgsl
-#import bevy_pbr::lighting as Lighting
+use bevy_pbr::lighting as Lighting;
 
-override fn Lighting::point_light (world_position: vec3<f32>) -> vec3<f32> {
+patch fn Lighting::point_light (world_position: vec3<f32>) -> vec3<f32> {
     let original = Lighting::point_light(world_position);
     let quantized = vec3<u32>(original * 3.0);
     return vec3<f32>(quantized) / 3.0;
 }
 ```
 
-overrides must either be declared in the top-level shader, or the module containing the override must be imported as an `additional_import` in a `Composer::add_composable_module` or `Composer::make_naga_module` call. using `#import` to import a module with overrides will not work due to tree-shaking.
+patches must either be declared in the top-level shader using `use patchset module_name;`, or the module containing the patch must be imported as an `additional_patchset` in a `Composer::add_composable_module` or `Composer::make_naga_module` call. Using `use patchset` to import a module with patches will not work due to tree-shaking.
 
-override function definitions cause *all* calls to the original function in the entire shader scope to be replaced by calls to the new function, with the exception of calls within the override function itself.
+patch function definitions cause _all_ calls to the original function in the entire shader scope to be replaced by calls to the new function, with the exception of calls within the patch function itself.
 
-the function signature of the override must match the base function. 
+the function signature of the patch must match the base function.
 
-overrides can be specified at any point in the final shader's import tree. 
+patches can be specified at any point in the final shader's import tree.
 
-multiple overrides can be applied to the same function. for example, given :
-- a module `a` containing a function `f`, 
-- a module `b` that imports `a`, and containing an `override a::f` function, 
-- a module `c` that imports `a` and `b`, and containing an `override a::f` function,
+multiple patches can be applied to the same function. for example, given :
 
-then `b` and `c` both specify an override for `a::f`. 
+- a module `a` containing a function `f`,
+- a module `b` that uses `a`, and containing an `patch a::f` function,
+- a module `c` that imports `a` and `b`, and containing an `patch a::f` function,
 
-the `override fn a::f` declared in module `b` may call to `a::f` within its body.
+then `b` and `c` both specify an patch for `a::f`.
 
-the `override fn a::f` declared in module `c` may call to `a::f` within its body, but the call will be redirected to `b::f`.
+the `patch fn a::f` declared in module `b` may call to `a::f` within its body.
+
+the `patch fn a::f` declared in module `c` may call to `a::f` within its body, but the call will be redirected to `b::f`.
 
 any other calls to `a::f` (within modules `a` or `b`, or anywhere else) will end up redirected to `c::f`.
 
-in this way a chain or stack of overrides can be applied.
+in this way a chain or stack of patches can be applied.
 
-different overrides of the same function can be specified in different import branches. the final stack will be ordered based on the first occurrence of the override in the import tree (using a depth first search). 
+different patches of the same function can be specified in different import branches. the final stack will be ordered based on the first occurrence of the patches in the import tree (using a depth first search).
 
-note that imports into a module/shader are processed in order, but are processed before the body of the current shader/module regardless of where they occur in that module, so there is no way to import a module containing an override and inject a call into the override stack prior to that imported override. you can instead create two modules each containing an override and import them into a parent module/shader to order them as required.
+note that imports into a module/shader are processed in order, but are processed before the body of the current shader/module regardless of where they occur in that module, so there is no way to import a module containing a patch and inject a call into the patch stack prior to that imported patch. you can instead create two modules each containing a patch and import them into a parent module/shader to order them as required.
 
-override functions can currently only be defined in wgsl.
+patch functions can currently only be defined in wgsl.
 
-if the `override_any` crate feature is enabled, then the `virtual` keyword is not required for the function being overridden.
+if the `patch_any` crate feature is enabled, then the `virtual` keyword is not required for the function being overridden.
 
 ## languages
 
@@ -148,10 +153,12 @@ fn get_number() -> f32 {
     #endif
 }
 ```
+
 the `#ifdef` directive matches when the def name exists in the input binding set (regardless of value). the `#ifndef` directive is the reverse.
 
 the `#if` directive requires a def name, an operator, and a value for comparison:
-- the def name must be a provided `shader_def` name. 
+
+- the def name must be a provided `shader_def` name.
 - the operator must be one of `==`, `!=`, `>=`, `>`, `<`, `<=`
 - the value must be an integer literal if comparing to a `ShaderDefValue::Int` or `ShaderDefValue::Uint`, or `true` or `false` if comparing to a `ShaderDef::Bool`.
 
@@ -172,9 +179,11 @@ fn get_number() -> f32 {
 ```
 
 shader defs can be created or overridden at the start of the top-level shader with the `#define` directive:
+
 ```wgsl
 #define USER_NUMBER 42
 ```
+
 the created value will default to `true` if not specified.
 
 ## error reporting

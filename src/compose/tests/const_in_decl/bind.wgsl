@@ -2,6 +2,6 @@
 
 #import consts
 
-const y: u32 = 2u;
+pub const y: u32 = 2u;
 
-var<private> arr: array<u32, consts::X>;
+pub var<private> arr: array<u32, consts::X>;

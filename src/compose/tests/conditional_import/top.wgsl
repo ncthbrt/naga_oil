@@ -4,6 +4,6 @@
     #import b C
 #endif
 
-fn main() -> u32 {
+pub fn main() -> u32 {
     return C;
 }

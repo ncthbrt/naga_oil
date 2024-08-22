@@ -2,6 +2,6 @@
 
 #import consts
 
-fn f() -> f32 {
+pub fn f() -> f32 {
     return consts::PI * 1.0;
 }

@@ -4,7 +4,7 @@
 // #import struct_members
 #import structs
 
-fn main() -> f32 {
+pub fn main() -> f32 {
     let a = consts::fine + consts::bad_;
     let b = fns::fine(1.0) + fns::bad_(2.0);
     let c = globals::fine + globals::bad_;

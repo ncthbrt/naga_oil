@@ -1,6 +1,6 @@
-#import mod
+use mod;
 
-override fn mod::outer() -> f32 {
+pub patch fn mod::outer() -> f32 {
     return 99.0;
 }
 

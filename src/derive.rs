@@ -30,6 +30,7 @@ pub struct DerivedModule<'a> {
     globals: Arena<GlobalVariable>,
     functions: Arena<Function>,
     pipeline_overrides: Arena<Override>,
+    entrypoints: Vec<EntryPoint>,
 }
 
 impl<'a> DerivedModule<'a> {
@@ -64,6 +65,18 @@ impl<'a> DerivedModule<'a> {
     // remap a type from source context into our derived context
     pub fn import_type(&mut self, h_type: &Handle<Type>) -> Handle<Type> {
         self.rename_type(h_type, None)
+    }
+
+    pub fn import_entrypoint(&mut self, entrypoint: &EntryPoint) {
+        let mapped_func = self.localize_function(&entrypoint.function);
+
+        self.entrypoints.push(EntryPoint {
+            name: entrypoint.name.clone(),
+            stage: entrypoint.stage,
+            early_depth_test: entrypoint.early_depth_test,
+            workgroup_size: entrypoint.workgroup_size,
+            function: mapped_func,
+        })
     }
 
     // remap a type from source context into our derived context, and rename it
@@ -131,9 +144,13 @@ impl<'a> DerivedModule<'a> {
             new_h
         })
     }
+    // remap a const from source context into our derived context, and rename it
 
-    // remap a const from source context into our derived context
-    pub fn import_const(&mut self, h_const: &Handle<Constant>) -> Handle<Constant> {
+    pub fn rename_const(
+        &mut self,
+        h_const: &Handle<Constant>,
+        name: Option<String>,
+    ) -> Handle<Constant> {
         self.const_map.get(h_const).copied().unwrap_or_else(|| {
             let c = self
                 .shader
@@ -144,7 +161,7 @@ impl<'a> DerivedModule<'a> {
                 .unwrap();
 
             let new_const = Constant {
-                name: c.name.clone(),
+                name: name.or_else(|| c.name.clone()),
                 ty: self.import_type(&c.ty),
                 init: self.import_global_expression(c.init),
             };
@@ -157,9 +174,17 @@ impl<'a> DerivedModule<'a> {
             new_h
         })
     }
+    // remap a const from source context into our derived context
+    pub fn import_const(&mut self, h_const: &Handle<Constant>) -> Handle<Constant> {
+        self.rename_const(h_const, None)
+    }
 
-    // remap a global from source context into our derived context
-    pub fn import_global(&mut self, h_global: &Handle<GlobalVariable>) -> Handle<GlobalVariable> {
+    // remaps a global from source context into our derived context, and renames it
+    pub fn rename_global(
+        &mut self,
+        h_global: &Handle<GlobalVariable>,
+        name: Option<String>,
+    ) -> Handle<GlobalVariable> {
         self.global_map.get(h_global).copied().unwrap_or_else(|| {
             let gv = self
                 .shader
@@ -170,7 +195,7 @@ impl<'a> DerivedModule<'a> {
                 .unwrap();
 
             let new_global = GlobalVariable {
-                name: gv.name.clone(),
+                name: name.or_else(|| gv.name.clone()),
                 space: gv.space,
                 binding: gv.binding.clone(),
                 ty: self.import_type(&gv.ty),
@@ -191,6 +216,11 @@ impl<'a> DerivedModule<'a> {
         })
     }
 
+    // remap a global from source context into our derived context
+    pub fn import_global(&mut self, h_global: &Handle<GlobalVariable>) -> Handle<GlobalVariable> {
+        self.rename_global(&h_global, None)
+    }
+
     // remap either a const or pipeline override expression from source context into our derived context
     pub fn import_global_expression(&mut self, h_expr: Handle<Expression>) -> Handle<Expression> {
         self.import_expression(
@@ -203,8 +233,12 @@ impl<'a> DerivedModule<'a> {
         )
     }
 
-    // remap a pipeline override from source context into our derived context
-    pub fn import_pipeline_override(&mut self, h_override: &Handle<Override>) -> Handle<Override> {
+    // imports a pipeline override from source context into our derived context
+    pub fn rename_pipeline_override(
+        &mut self,
+        h_override: &Handle<Override>,
+        name: Option<String>,
+    ) -> Handle<Override> {
         self.pipeline_override_map
             .get(h_override)
             .copied()
@@ -218,7 +252,7 @@ impl<'a> DerivedModule<'a> {
                     .unwrap();
 
                 let new_override = Override {
-                    name: pipeline_override.name.clone(),
+                    name: name.or_else(|| pipeline_override.name.clone()),
                     id: pipeline_override.id,
                     ty: self.import_type(&pipeline_override.ty),
                     init: pipeline_override
@@ -238,6 +272,11 @@ impl<'a> DerivedModule<'a> {
                 self.pipeline_override_map.insert(*h_override, new_h);
                 new_h
             })
+    }
+
+    // remap a pipeline override from source context into our derived context
+    pub fn import_pipeline_override(&mut self, h_override: &Handle<Override>) -> Handle<Override> {
+        self.rename_pipeline_override(&h_override, None)
     }
 
     // remap a block
@@ -808,6 +847,8 @@ impl<'a> DerivedModule<'a> {
     }
 
     pub fn into_module_with_entrypoints(mut self) -> naga::Module {
+        let other_entrypoints = self.entrypoints.clone();
+
         let entry_points = self
             .shader
             .unwrap()
@@ -820,6 +861,7 @@ impl<'a> DerivedModule<'a> {
                 workgroup_size: ep.workgroup_size,
                 function: self.localize_function(&ep.function),
             })
+            .chain(other_entrypoints)
             .collect();
 
         naga::Module {

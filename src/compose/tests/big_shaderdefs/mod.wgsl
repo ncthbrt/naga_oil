@@ -1,6 +1,6 @@
 #define_import_path mod
 
-fn f() -> f32 {
+pub fn f() -> f32 {
     var x = 0.0;
 #ifdef a1
 #ifdef a2
@@ -141,4 +141,3 @@ fn f() -> f32 {
 #endif
     return x;
 }
-

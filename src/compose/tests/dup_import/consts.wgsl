@@ -1,3 +1,3 @@
 #define_import_path consts
 
-const PI: f32         = 3.1;
+pub const PI: f32         = 3.1;

@@ -1,0 +1,8 @@
+error: no definition in scope for identifier: 'zdd'
+  ┌─ tests/error_test/wgsl_parse_err.wgsl:1:1
+  │
+1 │ 
+  │   unknown identifier
+  │
+  = no definition in scope for identifier: 'zdd'
+

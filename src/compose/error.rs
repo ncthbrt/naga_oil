@@ -36,16 +36,9 @@ impl ErrSource {
     pub fn source<'a>(&'a self, composer: &'a Composer) -> Cow<'a, String> {
         match self {
             ErrSource::Module { name, defs, .. } => {
-                let raw_source = &composer.module_sets.get(name).unwrap().sanitized_source;
-                let Ok(PreprocessOutput {
-                    preprocessed_source: source,
-                    ..
-                }) = composer.preprocessor.preprocess(raw_source, defs)
-                else {
-                    return Default::default();
-                };
-
-                Cow::Owned(source)
+                let module_set = &composer.module_sets.get(name).unwrap();
+                let output = module_set.get_preprocess_output(&defs).unwrap();
+                Cow::Owned(output.preprocessed_source.to_owned())
             }
             ErrSource::Constructing { source, .. } => Cow::Borrowed(source),
         }
@@ -69,9 +62,11 @@ pub struct ComposerError {
 #[derive(Debug, Error)]
 pub enum ComposerErrorInner {
     #[error("{0}")]
-    ImportParseError(String, usize),
-    #[error("required import '{0}' not found")]
-    ImportNotFound(String, usize),
+    UsageParseError(String, usize),
+    #[error("required module '{0}' not found")]
+    ModuleNotFound(String, usize),
+    #[error("required module item '{0}::{1}' not found")]
+    ModuleItemNotFound(String, String, usize),
     #[error("{0}")]
     WgslParseError(naga::front::wgsl::ParseError),
     #[cfg(feature = "glsl")]
@@ -115,12 +110,14 @@ pub enum ComposerErrorInner {
     DecorationInSource(Range<usize>),
     #[error("naga oil only supports glsl 440 and 450")]
     GlslInvalidVersion(usize),
-    #[error("invalid override :{0}")]
+    #[error("invalid patch :{0}")]
     RedirectError(#[from] RedirectError),
     #[error(
-        "override is invalid as `{name}` is not virtual (this error can be disabled with feature 'override_any')"
+        "patch is invalid as `{name}` is not virtual (this error can be disabled with feature 'patch_any')"
     )]
-    OverrideNotVirtual { name: String, pos: usize },
+    PatchNotVirtual { name: String, pos: usize },
+    #[error("virtual function is invalid as `{name}` is not public")]
+    VirtualFunctionNotPublic { name: String, pos: usize },
     #[error(
         "Composable module identifiers must not require substitution according to naga writeback rules: `{original}`"
     )]
@@ -133,6 +130,8 @@ pub enum ComposerErrorInner {
     },
     #[error("#define statements are only allowed at the start of the top-level shaders")]
     DefineInModule(usize),
+    #[error("Ambiguous exports were found for symbol {0}")]
+    AmbiguousExportError(String),
 }
 
 struct ErrorSources<'a> {
@@ -206,11 +205,15 @@ impl ComposerError {
                     .map(|source| source.to_string())
                     .collect(),
             ),
-            ComposerErrorInner::ImportNotFound(msg, pos) => (
+            ComposerErrorInner::ModuleNotFound(msg, pos) => (
                 vec![Label::primary((), *pos..*pos)],
-                vec![format!("missing import '{msg}'")],
+                vec![format!("missing module '{msg}'")],
             ),
-            ComposerErrorInner::ImportParseError(msg, pos) => (
+            ComposerErrorInner::ModuleItemNotFound(msg, item, pos) => (
+                vec![Label::primary((), *pos..*pos)],
+                vec![format!("missing or private import item '{msg}::{item}'")],
+            ),
+            ComposerErrorInner::UsageParseError(msg, pos) => (
                 vec![Label::primary((), *pos..*pos)],
                 vec![format!("invalid import spec: '{msg}'")],
             ),
@@ -240,7 +243,8 @@ impl ComposerError {
             | ComposerErrorInner::UnknownShaderDef { pos, .. }
             | ComposerErrorInner::UnknownShaderDefOperator { pos, .. }
             | ComposerErrorInner::InvalidShaderDefComparisonValue { pos, .. }
-            | ComposerErrorInner::OverrideNotVirtual { pos, .. }
+            | ComposerErrorInner::PatchNotVirtual { pos, .. }
+            | ComposerErrorInner::VirtualFunctionNotPublic { pos, .. }
             | ComposerErrorInner::GlslInvalidVersion(pos)
             | ComposerErrorInner::DefineInModule(pos)
             | ComposerErrorInner::InvalidShaderDefDefinitionValue { pos, .. } => {
@@ -256,10 +260,9 @@ impl ComposerError {
             ComposerErrorInner::InconsistentShaderDefValue { def } => {
                 return format!("{path}: multiple inconsistent shader def values: '{def}'");
             }
-            ComposerErrorInner::RedirectError(..) => (
-                vec![Label::primary((), 0..0)],
-                vec![format!("override error")],
-            ),
+            ComposerErrorInner::RedirectError(..) => {
+                (vec![Label::primary((), 0..0)], vec![format!("patch error")])
+            }
             ComposerErrorInner::NoModuleName => {
                 return format!(
                     "{path}: no #define_import_path declaration found in composable module"
@@ -270,6 +273,9 @@ impl ComposerError {
                     .with_message(self.inner.to_string())],
                 vec![],
             ),
+            ComposerErrorInner::AmbiguousExportError(symbol_name) => {
+                return format!("Ambiguous exports were found for symbol {symbol_name}");
+            }
         };
 
         let diagnostic = Diagnostic::error()

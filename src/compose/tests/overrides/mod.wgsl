@@ -2,10 +2,10 @@
 
 // This is a comment
 
-virtual fn inner(arg: f32) -> f32 {
+pub virtual fn inner(arg: f32) -> f32 {
     return arg * 2.0;
 }
 
-fn outer() -> f32 {
+pub fn outer() -> f32 {
     return inner(1.0);
 }

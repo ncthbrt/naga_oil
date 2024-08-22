@@ -1,7 +1,7 @@
-#import mod
+use mod;
 
 // This is a comment
-override fn mod::inner(arg: f32) -> f32 {
+pub patch fn mod::inner(arg: f32) -> f32 {
     return arg * 3.0;
 }
 

@@ -1,4 +1,4 @@
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 /// the compose module allows construction of shaders from modules (which are themselves shaders).
 ///
 /// it does this by treating shaders as modules, and
@@ -62,36 +62,36 @@ use indexmap::IndexMap;
 /// ```ignore
 /// #import bevy_pbr::lighting as Lighting
 ///
-/// override fn Lighting::point_light (world_position: vec3<f32>) -> vec3<f32> {
+/// patch fn Lighting::point_light (world_position: vec3<f32>) -> vec3<f32> {
 ///     let original = Lighting::point_light(world_position);
 ///     let quantized = vec3<u32>(original * 3.0);
 ///     return vec3<f32>(quantized) / 3.0;
 /// }
 /// ```
 ///
-/// override function definitions cause *all* calls to the original function in the entire shader scope to be replaced by calls to the new function, with the exception of calls within the override function itself.
+/// patch function definitions cause *all* calls to the original function in the entire shader scope to be replaced by calls to the new function, with the exception of calls within the patch function itself.
 ///
-/// the function signature of the override must match the base function.
+/// the function signature of the patch must match the base function.
 ///
-/// overrides can be specified at any point in the final shader's import tree.
+/// patches can be specified at any point in the final shader's import tree.
 ///
-/// multiple overrides can be applied to the same function. for example, given :
+/// multiple patches can be applied to the same function. for example, given :
 /// - a module `a` containing a function `f`,
-/// - a module `b` that imports `a`, and containing an `override a::f` function,
-/// - a module `c` that imports `a` and `b`, and containing an `override a::f` function,
+/// - a module `b` that uses patchset `a`, and containing an `patch a::f` function,
+/// - a module `c` that uses patchset `a` and `b`, and containing an `patch a::f` function,
 ///
-/// then b and c both specify an override for `a::f`.
-/// the `override fn a::f` declared in module `b` may call to `a::f` within its body.
-/// the `override fn a::f` declared in module 'c' may call to `a::f` within its body, but the call will be redirected to `b::f`.
+/// then b and c both specify an patch for `a::f`.
+/// the `patch fn a::f` declared in module `b` may call to `a::f` within its body.
+/// the `patch fn a::f` declared in module 'c' may call to `a::f` within its body, but the call will be redirected to `b::f`.
 /// any other calls to `a::f` (within modules 'a' or `b`, or anywhere else) will end up redirected to `c::f`
-/// in this way a chain or stack of overrides can be applied.
+/// in this way a chain or stack of patches can be applied.
 ///
-/// different overrides of the same function can be specified in different import branches. the final stack will be ordered based on the first occurrence of the override in the import tree (using a depth first search).
+/// different patches of the same function can be specified in different import branches. the final stack will be ordered based on the first occurrence of the patch in the import tree (using a depth first search).
 ///
-/// note that imports into a module/shader are processed in order, but are processed before the body of the current shader/module regardless of where they occur in that module, so there is no way to import a module containing an override and inject a call into the override stack prior to that imported override. you can instead create two modules each containing an override and import them into a parent module/shader to order them as required.
-/// override functions can currently only be defined in wgsl.
+/// note that imports into a module/shader are processed in order, but are processed before the body of the current shader/module regardless of where they occur in that module, so there is no way to import a module containing an patch and inject a call into the patch stack prior to that imported patch. you can instead create two modules each containing an patch and import them into a parent module/shader to order them as required.
+/// patch functions can currently only be defined in wgsl.
 ///
-/// if the `override_any` crate feature is enabled, then the `virtual` keyword is not required for the function being overridden.
+/// if the `patch_any` crate feature is enabled, then the `virtual` keyword is not required for the function being overridden.
 ///
 /// ## languages
 ///
@@ -128,6 +128,7 @@ use indexmap::IndexMap;
 /// codespan reporting for errors is available using the error `emit_to_string` method. this requires validation to be enabled, which is true by default. `Composer::non_validating()` produces a non-validating composer that is not able to give accurate error reporting.
 ///
 use naga::EntryPoint;
+use preprocess::PreprocessResolver;
 use regex::Regex;
 use std::collections::{hash_map::Entry, BTreeMap, HashMap, HashSet};
 use tracing::{debug, trace};
@@ -143,7 +144,7 @@ use self::preprocess::Preprocessor;
 
 pub mod comment_strip_iter;
 pub mod error;
-pub mod parse_imports;
+pub mod parse_usages;
 pub mod preprocess;
 mod test;
 pub mod tokenizer;
@@ -217,28 +218,40 @@ impl ModuleKey {
     }
 }
 
+#[derive(Default, Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum Visibility {
+    #[default]
+    Public,
+}
+
 // a module built with a specific set of shader_defs
 #[derive(Default, Debug)]
 pub struct ComposableModule {
     // module decoration, prefixed to all items from this module in the final source
     pub decorated_name: String,
     // module names required as imports, optionally with a list of items to import
-    pub imports: Vec<ImportDefinition>,
+    pub usages: IndexMap<String, UseDefinition>,
+    pub used_patchsets: IndexSet<String>,
+    // module exports
+    pub exports: IndexMap<String, (Export, Visibility)>,
     // types exported
     pub owned_types: HashSet<String>,
     // constants exported
     pub owned_constants: HashSet<String>,
+    // pipeline override exported
+    pub owned_pipeline_overrides: HashSet<String>,
     // vars exported
     pub owned_vars: HashSet<String>,
     // functions exported
     pub owned_functions: HashSet<String>,
     // local functions that can be overridden
-    pub virtual_functions: HashSet<String>,
+    pub virtual_functions: HashMap<String, Visibility>,
     // overriding functions defined in this module
     // target function -> Vec<replacement functions>
-    pub override_functions: IndexMap<String, Vec<String>>,
+    pub patch_functions: IndexMap<String, (Vec<String>, Option<Visibility>)>,
     // naga module, built against headers for any imports
     module_ir: naga::Module,
+
     // headers in different shader languages, used for building modules/shaders that import this module
     // headers contain types, constants, global vars and empty function definitions -
     // just enough to convert source strings that want to import this module into naga IR
@@ -252,6 +265,7 @@ pub struct ComposableModule {
 #[derive(Debug)]
 pub struct ComposableModuleDefinition {
     pub name: String,
+    pub crate_name: Option<String>,
     // shader text (with auto bindings replaced - we do this on module add as we only want to do it once to avoid burning slots)
     pub sanitized_source: String,
     // language
@@ -260,18 +274,19 @@ pub struct ComposableModuleDefinition {
     pub file_path: String,
     // shader def values bound to this module
     pub shader_defs: HashMap<String, ShaderDefValue>,
+    // module visibility, set when adding the module to the composer
+    pub default_visibility: Option<Visibility>,
     // list of shader_defs that can affect this module
     effective_defs: Vec<String>,
     // full list of possible imports (regardless of shader_def configuration)
-    all_imports: HashSet<String>,
-    // additional imports to add (as though they were included in the source after any other imports)
-    additional_imports: Vec<ImportDefinition>,
+    all_usages: HashSet<String>,
+    // additional patchsets to add (as though they were included in the source after any other imports)
+    additional_patchsets: Vec<String>,
     // built composable modules for a given set of shader defs
     modules: HashMap<ModuleKey, ComposableModule>,
+    preprocess_output: HashMap<ModuleKey, PreprocessOutput>,
     // used in spans when this module is included
     module_index: usize,
-    // preprocessor meta data
-    // metadata: PreprocessorMetaData,
 }
 
 impl ComposableModuleDefinition {
@@ -281,6 +296,36 @@ impl ComposableModuleDefinition {
     ) -> Option<&ComposableModule> {
         self.modules
             .get(&ModuleKey::from_members(shader_defs, &self.effective_defs))
+    }
+
+    fn get_preprocess_output(
+        &self,
+        shader_defs: &HashMap<String, ShaderDefValue>,
+    ) -> Option<&PreprocessOutput> {
+        self.preprocess_output
+            .get(&ModuleKey::from_members(shader_defs, &self.effective_defs))
+    }
+
+    fn insert_preprocess_output(
+        &mut self,
+        shader_defs: &HashMap<String, ShaderDefValue>,
+        preprocess_output: PreprocessOutput,
+    ) -> &PreprocessOutput {
+        match self
+            .preprocess_output
+            .entry(ModuleKey::from_members(shader_defs, &self.effective_defs))
+        {
+            Entry::Occupied(_) => panic!("entry already populated"),
+            Entry::Vacant(v) => v.insert(preprocess_output),
+        }
+    }
+
+    fn remove_preprocess_output(
+        &mut self,
+        shader_defs: &HashMap<String, ShaderDefValue>,
+    ) -> Option<PreprocessOutput> {
+        self.preprocess_output
+            .remove(&ModuleKey::from_members(shader_defs, &self.effective_defs))
     }
 
     fn insert_module(
@@ -299,14 +344,45 @@ impl ComposableModuleDefinition {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ImportDefinition {
-    pub import: String,
+pub struct UseDefinition {
+    pub module: String,
     pub items: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CanonicalImportDefinition {
+    pub module: String,
+    pub items: IndexSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverrideMode {
+    Virtual,
+    Static,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub enum UseBehaviour {
+    #[default]
+    ModuleSystem,
+    Legacy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Export {
+    Function(OverrideMode),
+    Variable,
+    Constant,
+    Alias,
+    Struct,
+    Override,
+    Use(String, Option<String>, UseBehaviour),
+    Module,
+}
+
 #[derive(Debug, Clone)]
-pub struct ImportDefWithOffset {
-    definition: ImportDefinition,
+pub struct UseDefWithOffset {
+    definition: UseDefinition,
     offset: usize,
 }
 
@@ -317,14 +393,16 @@ pub struct ImportDefWithOffset {
 pub struct Composer {
     pub validate: bool,
     pub module_sets: HashMap<String, ComposableModuleDefinition>,
+    pub module_exports: HashMap<String, IndexMap<String, Vec<(Export, Visibility)>>>,
+    pub module_mappings: HashMap<String, IndexMap<String, Visibility>>,
     pub module_index: HashMap<usize, String>,
     pub capabilities: naga::valid::Capabilities,
     preprocessor: Preprocessor,
     check_decoration_regex: Regex,
     undecorate_regex: Regex,
     virtual_fn_regex: Regex,
-    override_fn_regex: Regex,
-    undecorate_override_regex: Regex,
+    patch_fn_regex: Regex,
+    undecorate_patch_regex: Regex,
     auto_binding_regex: Regex,
     auto_binding_index: u32,
 }
@@ -341,6 +419,8 @@ impl Default for Composer {
             validate: true,
             capabilities: Default::default(),
             module_sets: Default::default(),
+            module_exports: Default::default(),
+            module_mappings: Default::default(),
             module_index: Default::default(),
             preprocessor: Preprocessor::default(),
             check_decoration_regex: Regex::new(
@@ -365,16 +445,16 @@ impl Default for Composer {
                 r"(?P<lead>[\s]*)(?P<virtual_keyword>virtual\s+)(?<fn_keyword>fn\s+)(?P<function_name>[^\s]+)(?P<trail>\s*)\(",
             )
             .unwrap(),
-            override_fn_regex: Regex::new(
+            patch_fn_regex: Regex::new(
                 format!(
-                    r"(override\s+fn\s+)([^\s]+){}([\w\d]+){}(\s*)\(",
+                    r"(patch\s+fn\s+)(?P<target_function>[^\s]+){}(?P<target_module>[\w\d]+){}(?P<trail>\s*)\(",
                     regex_syntax::escape(DECORATION_PRE),
                     regex_syntax::escape(DECORATION_POST)
                 )
                 .as_str(),
             )
             .unwrap(),
-            undecorate_override_regex: Regex::new(
+            undecorate_patch_regex: Regex::new(
                 format!(
                     "{}([A-Z0-9]*){}",
                     regex_syntax::escape(DECORATION_OVERRIDE_PRE),
@@ -384,7 +464,7 @@ impl Default for Composer {
             )
             .unwrap(),
             auto_binding_regex: Regex::new(r"@binding\(auto\)").unwrap(),
-            auto_binding_index: 0,
+            auto_binding_index: 0
         }
     }
 }
@@ -398,7 +478,11 @@ const DECORATION_OVERRIDE_PRE: &str = "X_naga_oil_vrt_X";
 struct IrBuildResult {
     module: naga::Module,
     start_offset: usize,
-    override_functions: IndexMap<String, Vec<String>>,
+    patch_functions: IndexMap<String, (Vec<String>, Option<Visibility>)>,
+}
+
+fn decode(from: &str) -> String {
+    String::from_utf8(data_encoding::BASE32_NOPAD.decode(from.as_bytes()).unwrap()).unwrap()
 }
 
 impl Composer {
@@ -414,10 +498,6 @@ impl Composer {
         format!("{DECORATION_PRE}{encoded}{DECORATION_POST}")
     }
 
-    fn decode(from: &str) -> String {
-        String::from_utf8(data_encoding::BASE32_NOPAD.decode(from.as_bytes()).unwrap()).unwrap()
-    }
-
     /// Shorthand for creating a naga validator.
     fn create_validator(&self) -> naga::valid::Validator {
         naga::valid::Validator::new(naga::valid::ValidationFlags::all(), self.capabilities)
@@ -430,18 +510,15 @@ impl Composer {
                 format!(
                     "{}{}::{}",
                     caps.get(1).map(|cc| cc.as_str()).unwrap_or(""),
-                    Self::decode(caps.get(3).unwrap().as_str()),
+                    decode(caps.get(3).unwrap().as_str()),
                     caps.get(2).unwrap().as_str()
                 )
             });
 
         let undecor =
-            self.undecorate_override_regex
+            self.undecorate_patch_regex
                 .replace_all(&undecor, |caps: &regex::Captures| {
-                    format!(
-                        "override fn {}::",
-                        Self::decode(caps.get(1).unwrap().as_str())
-                    )
+                    format!("patch fn {}::", decode(caps.get(1).unwrap().as_str()))
                 });
 
         undecor.to_string()
@@ -576,7 +653,8 @@ impl Composer {
         name: &str,
         source: String,
         language: ShaderLanguage,
-        imports: &[ImportDefinition],
+        uages: &[UseDefinition],
+        patchsets: &IndexSet<String>,
         shader_defs: &HashMap<String, ShaderDefValue>,
     ) -> Result<IrBuildResult, ComposerError> {
         debug!("creating IR for {} with defs: {:?}", name, shader_defs);
@@ -587,45 +665,44 @@ impl Composer {
             ShaderLanguage::Glsl => String::from("#version 450\n"),
         };
 
-        let mut override_functions: IndexMap<String, Vec<String>> = IndexMap::default();
-        let mut added_imports: HashSet<String> = HashSet::new();
+        let mut patch_functions: IndexMap<String, (Vec<String>, Option<Visibility>)> =
+            IndexMap::default();
         let mut header_module = DerivedModule::default();
-
-        for import in imports {
-            if added_imports.contains(&import.import) {
-                continue;
-            }
+        let mut already_added = Default::default();
+        for usage in uages {
             // add to header module
-            self.add_import(
+            let is_patchset = patchsets.contains(&usage.module);
+            self.add_usage(
                 &mut header_module,
-                import,
+                usage,
                 shader_defs,
                 true,
-                &mut added_imports,
+                &mut already_added,
+                is_patchset,
             );
-
-            // // we must have ensured these exist with Composer::ensure_imports()
-            trace!("looking for {}", import.import);
-            let import_module_set = self.module_sets.get(&import.import).unwrap();
+            trace!("looking for {}", usage.module);
+            let import_module_set = self.module_sets.get(&usage.module).unwrap();
             trace!("with defs {:?}", shader_defs);
             let module = import_module_set.get_module(shader_defs).unwrap();
             trace!("ok");
 
-            // gather overrides
-            if !module.override_functions.is_empty() {
-                for (original, replacements) in &module.override_functions {
-                    match override_functions.entry(original.clone()) {
-                        indexmap::map::Entry::Occupied(o) => {
-                            let existing = o.into_mut();
-                            let new_replacements: Vec<_> = replacements
-                                .iter()
-                                .filter(|rep| !existing.contains(rep))
-                                .cloned()
-                                .collect();
-                            existing.extend(new_replacements);
-                        }
-                        indexmap::map::Entry::Vacant(v) => {
-                            v.insert(replacements.clone());
+            // gather patches
+            if !module.patch_functions.is_empty() {
+                for (original, (replacements, visibility)) in &module.patch_functions {
+                    if let Some(_) = visibility {
+                        match patch_functions.entry(original.clone()) {
+                            indexmap::map::Entry::Occupied(o) => {
+                                let existing = o.into_mut();
+                                let new_replacements: Vec<_> = replacements
+                                    .iter()
+                                    .filter(|rep| !existing.0.contains(rep))
+                                    .cloned()
+                                    .collect();
+                                existing.0.extend(new_replacements);
+                            }
+                            indexmap::map::Entry::Vacant(v) => {
+                                v.insert((replacements.clone(), visibility.clone()));
+                            }
                         }
                     }
                 }
@@ -692,7 +769,7 @@ impl Composer {
         Ok(IrBuildResult {
             module,
             start_offset,
-            override_functions,
+            patch_functions,
         })
     }
 
@@ -838,87 +915,80 @@ impl Composer {
         shader_defs: &HashMap<String, ShaderDefValue>,
         create_headers: bool,
         demote_entrypoints: bool,
-        source: &str,
-        imports: Vec<ImportDefWithOffset>,
+        preprocess_output: &PreprocessOutput,
+        module_mappings: &mut HashMap<String, IndexMap<String, Visibility>>,
     ) -> Result<ComposableModule, ComposerError> {
-        let mut imports: Vec<_> = imports
-            .into_iter()
-            .map(|import_with_offset| import_with_offset.definition)
+        let mut usages: Vec<_> = preprocess_output
+            .usages
+            .iter()
+            .map(|import_with_offset| import_with_offset.definition.clone())
             .collect();
-        imports.extend(module_definition.additional_imports.to_vec());
+
+        if let Some(visibility) = module_definition.default_visibility {
+            module_mappings
+                .entry(module_definition.name.to_string())
+                .or_default()
+                .insert(module_definition.name.to_string(), visibility.clone());
+        }
+
+        usages.extend(
+            module_definition
+                .additional_patchsets
+                .iter()
+                .map(|x| UseDefinition {
+                    module: x.to_string(),
+                    items: vec![],
+                }),
+        );
 
         trace!(
             "create composable module {}: source len {}",
             module_definition.name,
-            source.len()
+            &preprocess_output.preprocessed_source.len()
         );
 
+        let wrap_err = |inner: ComposerErrorInner| -> ComposerError {
+            ComposerError {
+                inner,
+                source: ErrSource::Module {
+                    name: module_definition.name.to_owned(),
+                    offset: 0,
+                    defs: shader_defs.clone(),
+                },
+            }
+        };
+
         // record virtual/overridable functions
-        let mut virtual_functions: HashSet<String> = Default::default();
-        let source = self
-            .virtual_fn_regex
-            .replace_all(source, |cap: &regex::Captures| {
+        let mut virtual_functions: HashMap<String, Visibility> = Default::default();
+        let source = self.virtual_fn_regex.replace_all(
+            &preprocess_output.preprocessed_source,
+            |cap: &regex::Captures| {
                 let function_name = cap.name("function_name").unwrap().as_str();
+
                 let lead = cap.name("lead").unwrap().as_str();
                 let trail = cap.name("trail").unwrap().as_str();
                 let fn_keyword = cap.name("fn_keyword").unwrap().as_str();
 
                 let replacement_str = format!("{lead}{fn_keyword}{function_name}{trail}(");
-                virtual_functions.insert(function_name.to_string());
+                if let Some((Export::Function(OverrideMode::Virtual), visibility)) =
+                    preprocess_output.exports.get(function_name)
+                {
+                    virtual_functions.insert(function_name.to_string(), visibility.clone());
+                }
                 replacement_str
-            });
-
+            },
+        );
         // record and rename override functions
-        let mut local_override_functions: IndexMap<String, String> = Default::default();
+        let mut local_patch_functions: IndexMap<String, (String, Option<Visibility>)> =
+            Default::default();
 
-        #[cfg(not(feature = "override_any"))]
-        let mut override_error = None;
-
-        let source =
-            self.override_fn_regex
+        #[cfg(not(feature = "patch_any"))]
+        let mut patch_error = None;
+        let source = if module_definition.language == ShaderLanguage::Wgsl {
+            self.patch_fn_regex
                 .replace_all(&source, |cap: &regex::Captures| {
-                    let target_module = cap.get(3).unwrap().as_str().to_owned();
-                    let target_function = cap.get(2).unwrap().as_str().to_owned();
-
-                    #[cfg(not(feature = "override_any"))]
-                    {
-                        let wrap_err = |inner: ComposerErrorInner| -> ComposerError {
-                            ComposerError {
-                                inner,
-                                source: ErrSource::Module {
-                                    name: module_definition.name.to_owned(),
-                                    offset: 0,
-                                    defs: shader_defs.clone(),
-                                },
-                            }
-                        };
-
-                        // ensure overrides are applied to virtual functions
-                        let raw_module_name = Self::decode(&target_module);
-                        let module_set = self.module_sets.get(&raw_module_name);
-
-                        match module_set {
-                            None => {
-                                // TODO this should be unreachable?
-                                let pos = cap.get(3).unwrap().start();
-                                override_error = Some(wrap_err(
-                                    ComposerErrorInner::ImportNotFound(raw_module_name, pos),
-                                ));
-                            }
-                            Some(module_set) => {
-                                let module = module_set.get_module(shader_defs).unwrap();
-                                if !module.virtual_functions.contains(&target_function) {
-                                    let pos = cap.get(2).unwrap().start();
-                                    override_error =
-                                        Some(wrap_err(ComposerErrorInner::OverrideNotVirtual {
-                                            name: target_function.clone(),
-                                            pos,
-                                        }));
-                                }
-                            }
-                        }
-                    }
-
+                    let target_module = cap.name("target_module").unwrap().as_str().to_owned();
+                    let target_function = cap.name("target_function").unwrap().as_str().to_owned();
                     let base_name = format!(
                         "{}{}{}{}",
                         target_function.as_str(),
@@ -934,25 +1004,64 @@ impl Composer {
                         DECORATION_POST,
                     );
 
-                    let replacement_str = format!(
-                        "{}fn {}{}(",
-                        " ".repeat(cap.get(1).unwrap().range().len() - 3),
-                        rename,
-                        " ".repeat(cap.get(4).unwrap().range().len()),
-                    );
+                    let raw_module_name = decode(&target_module);
 
-                    local_override_functions.insert(rename, base_name);
+                    let visibility = if let Some((_, visibility)) = preprocess_output
+                        .exports
+                        .get(&format!("{}::{target_function}", raw_module_name))
+                    {
+                        Some(visibility.clone())
+                    } else {
+                        None
+                    };
+
+                    #[cfg(not(feature = "patch_any"))]
+                    {
+                        // ensure overrides are applied to virtual functions
+                        let module_set = self.module_sets.get(&raw_module_name);
+
+                        match module_set {
+                            None => {
+                                // TODO this should be unreachable?
+                                let pos = cap.name("target_module").unwrap().start();
+                                patch_error = Some(wrap_err(ComposerErrorInner::ModuleNotFound(
+                                    raw_module_name,
+                                    pos,
+                                )));
+                            }
+                            Some(module_set) => {
+                                let module = module_set.get_module(shader_defs).unwrap();
+                                if !module.virtual_functions.contains_key(&target_function) {
+                                    let pos = cap.name("target_function").unwrap().start();
+                                    patch_error =
+                                        Some(wrap_err(ComposerErrorInner::PatchNotVirtual {
+                                            name: target_function.clone(),
+                                            pos,
+                                        }));
+                                }
+                            }
+                        }
+                    }
+
+                    let replacement_str =
+                        format!("fn {}{}(", rename, cap.name("trail").unwrap().as_str());
+
+                    local_patch_functions.insert(rename, (base_name, visibility));
 
                     replacement_str
                 })
-                .to_string();
+                .to_string()
+        } else {
+            source.to_string()
+        };
 
-        #[cfg(not(feature = "override_any"))]
-        if let Some(err) = override_error {
+        #[cfg(not(feature = "patch_any"))]
+        if let Some(err) = patch_error {
             return Err(err);
         }
 
-        trace!("local overrides: {:?}", local_override_functions);
+        trace!("local patches: {:?}", local_patch_functions);
+
         trace!(
             "create composable module {}: source len {}",
             module_definition.name,
@@ -962,12 +1071,13 @@ impl Composer {
         let IrBuildResult {
             module: mut source_ir,
             start_offset,
-            mut override_functions,
+            mut patch_functions,
         } = self.create_module_ir(
             &module_definition.name,
             source,
             module_definition.language,
-            &imports,
+            &usages,
+            &preprocess_output.patchsets,
             shader_defs,
         )?;
 
@@ -984,10 +1094,11 @@ impl Composer {
         };
 
         // add our local override to the total set of overrides for the given function
-        for (rename, base_name) in &local_override_functions {
-            override_functions
+        for (rename, (base_name, visibility)) in &local_patch_functions {
+            patch_functions
                 .entry(base_name.clone())
-                .or_default()
+                .or_insert((vec![], visibility.clone()))
+                .0
                 .push(format!("{rename}{module_decoration}"));
         }
 
@@ -1018,7 +1129,6 @@ impl Composer {
             if let Some(name) = gv.name.as_mut() {
                 if !name.contains(DECORATION_PRE) {
                     *name = format!("{name}{module_decoration}");
-
                     owned_vars.insert(name.clone(), h);
                 }
             }
@@ -1029,7 +1139,6 @@ impl Composer {
             if let Some(name) = f.name.as_mut() {
                 if !name.contains(DECORATION_PRE) {
                     *name = format!("{name}{module_decoration}");
-
                     // create dummy header function
                     let header_function = naga::Function {
                         name: Some(name.clone()),
@@ -1040,7 +1149,6 @@ impl Composer {
                         named_expressions: Default::default(),
                         body: Default::default(),
                     };
-
                     // record owned function
                     owned_functions.insert(name.clone(), (Some(h_f), header_function));
                 }
@@ -1184,13 +1292,16 @@ impl Composer {
 
         let composable_module = ComposableModule {
             decorated_name: module_decoration,
-            imports,
+            usages: usages.into_iter().map(|x| (x.module.clone(), x)).collect(),
+            used_patchsets: preprocess_output.patchsets.clone(),
+            exports: preprocess_output.exports.clone(),
             owned_types,
+            owned_pipeline_overrides: owned_pipeline_overrides.into_keys().collect(),
             owned_constants: owned_constants.into_keys().collect(),
             owned_vars: owned_vars.into_keys().collect(),
             owned_functions: owned_functions.into_keys().collect(),
             virtual_functions,
-            override_functions,
+            patch_functions,
             module_ir,
             header_ir,
             start_offset,
@@ -1206,6 +1317,7 @@ impl Composer {
         items: Option<&Vec<String>>,
         span_offset: usize,
         header: bool,
+        use_patchset: bool,
     ) {
         let items: Option<HashSet<String>> = items.map(|items| {
             items
@@ -1244,7 +1356,7 @@ impl Composer {
 
         for (h, po) in source_ir.overrides.iter() {
             if let Some(name) = &po.name {
-                if composable.owned_functions.contains(name)
+                if composable.owned_pipeline_overrides.contains(name)
                     && items.map_or(true, |items| items.contains(name))
                 {
                     derived.import_pipeline_override(&h);
@@ -1264,15 +1376,19 @@ impl Composer {
 
         for (h_f, f) in source_ir.functions.iter() {
             if let Some(name) = &f.name {
-                if composable.owned_functions.contains(name)
-                    && (items.map_or(true, |items| items.contains(name))
-                        || composable
-                            .override_functions
-                            .values()
-                            .any(|v| v.contains(name)))
-                {
-                    let span = composable.module_ir.functions.get_span(h_f);
-                    derived.import_function_if_new(f, span);
+                if composable.owned_functions.contains(name) {
+                    if items.map_or(true, |items| items.contains(name))
+                        || (use_patchset
+                            && composable.patch_functions.values().any(
+                                |(other_name, visibility)| {
+                                    other_name.contains(name) && visibility.is_some()
+                                },
+                            ))
+                    {
+                        // TODO Evalue visibility properly
+                        let span = composable.module_ir.functions.get_span(h_f);
+                        derived.import_function_if_new(f, span);
+                    }
                 }
             }
         }
@@ -1280,58 +1396,81 @@ impl Composer {
         derived.clear_shader_source();
     }
 
-    // add an import (and recursive imports) into a derived module
-    fn add_import<'a>(
+    // add a usage (and recursive usages) into a derived module
+    fn add_usage<'a>(
         &'a self,
         derived: &mut DerivedModule<'a>,
-        import: &ImportDefinition,
+        use_definition: &UseDefinition,
         shader_defs: &HashMap<String, ShaderDefValue>,
         header: bool,
         already_added: &mut HashSet<String>,
+        use_patchset: bool,
     ) {
-        if already_added.contains(&import.import) {
-            trace!("skipping {}, already added", import.import);
+        if already_added.contains(&use_definition.module) {
+            trace!("skipping {}, already added", use_definition.module);
             return;
         }
 
-        let import_module_set = self.module_sets.get(&import.import).unwrap();
-        let module = import_module_set.get_module(shader_defs).unwrap();
+        let usage_module_set = self.module_sets.get(&use_definition.module).unwrap();
+        let module = usage_module_set.get_module(shader_defs).unwrap();
 
-        for import in &module.imports {
-            self.add_import(derived, import, shader_defs, header, already_added);
+        for usage in module.usages.values() {
+            self.add_usage(
+                derived,
+                usage,
+                shader_defs,
+                header,
+                already_added,
+                module.used_patchsets.contains(&usage.module),
+            );
         }
 
         Self::add_composable_data(
             derived,
             module,
-            Some(&import.items),
-            import_module_set.module_index << SPAN_SHIFT,
+            Some(&use_definition.items),
+            usage_module_set.module_index << SPAN_SHIFT,
             header,
+            use_patchset,
         );
     }
 
-    fn ensure_import(
+    fn build_usage(
         &mut self,
         module_set: &ComposableModuleDefinition,
         shader_defs: &HashMap<String, ShaderDefValue>,
+        module_exports: &mut HashMap<String, IndexMap<String, Vec<(Export, Visibility)>>>,
+        module_mappings: &mut HashMap<String, IndexMap<String, Visibility>>,
     ) -> Result<ComposableModule, ComposerError> {
-        let PreprocessOutput {
-            preprocessed_source,
-            imports,
-        } = self
-            .preprocessor
-            .preprocess(&module_set.sanitized_source, shader_defs)
-            .map_err(|inner| ComposerError {
-                inner,
-                source: ErrSource::Module {
-                    name: module_set.name.to_owned(),
-                    offset: 0,
-                    defs: shader_defs.clone(),
-                },
-            })?;
+        let preprocess_output = module_set
+            .get_preprocess_output(shader_defs)
+            .expect("Expected to have errored before reaching this point");
 
-        self.ensure_imports(imports.iter().map(|import| &import.definition), shader_defs)?;
-        self.ensure_imports(&module_set.additional_imports, shader_defs)?;
+        let extension_and_patchset_imports = preprocess_output
+            .extensions
+            .iter()
+            .chain(&preprocess_output.patchsets)
+            .map(|extension| UseDefinition {
+                module: extension.to_string(),
+                items: vec![],
+            })
+            .collect::<Vec<UseDefinition>>();
+
+        self.build_usages(
+            preprocess_output
+                .usages
+                .iter()
+                .map(|usage| &usage.definition),
+            shader_defs,
+            module_exports,
+            module_mappings,
+        )?;
+        self.build_usages(
+            &extension_and_patchset_imports,
+            shader_defs,
+            module_exports,
+            module_mappings,
+        )?;
 
         self.create_composable_module(
             module_set,
@@ -1339,29 +1478,30 @@ impl Composer {
             shader_defs,
             true,
             true,
-            &preprocessed_source,
-            imports,
+            &preprocess_output,
+            module_mappings,
         )
     }
 
     // build required ComposableModules for a given set of shader_defs
-    fn ensure_imports<'a>(
+    fn build_usages<'a>(
         &mut self,
-        imports: impl IntoIterator<Item = &'a ImportDefinition>,
+        usages: impl IntoIterator<Item = &'a UseDefinition>,
         shader_defs: &HashMap<String, ShaderDefValue>,
+        module_exports: &mut HashMap<String, IndexMap<String, Vec<(Export, Visibility)>>>,
+        module_mappings: &mut HashMap<String, IndexMap<String, Visibility>>,
     ) -> Result<(), ComposerError> {
-        for ImportDefinition { import, .. } in imports.into_iter() {
-            // we've already ensured imports exist when they were added
-            let module_set = self.module_sets.get(import).unwrap();
+        for UseDefinition { module, .. } in usages.into_iter() {
+            // we've already ensured usages exist when they were added
+            let module_set = self.module_sets.get(module).unwrap();
             if module_set.get_module(shader_defs).is_some() {
                 continue;
             }
-
             // we need to build the module
             // take the set so we can recurse without borrowing
-            let (set_key, mut module_set) = self.module_sets.remove_entry(import).unwrap();
+            let (set_key, mut module_set) = self.module_sets.remove_entry(module).unwrap();
 
-            match self.ensure_import(&module_set, shader_defs) {
+            match self.build_usage(&module_set, shader_defs, module_exports, module_mappings) {
                 Ok(module) => {
                     module_set.insert_module(shader_defs, module);
                     self.module_sets.insert(set_key, module_set);
@@ -1383,7 +1523,7 @@ pub struct ComposableModuleDescriptor<'a> {
     pub file_path: &'a str,
     pub language: ShaderLanguage,
     pub as_name: Option<String>,
-    pub additional_imports: &'a [ImportDefinition],
+    pub additional_patchsets: &'a [String],
     pub shader_defs: HashMap<String, ShaderDefValue>,
 }
 
@@ -1393,7 +1533,7 @@ pub struct NagaModuleDescriptor<'a> {
     pub file_path: &'a str,
     pub shader_type: ShaderType,
     pub shader_defs: HashMap<String, ShaderDefValue>,
-    pub additional_imports: &'a [ImportDefinition],
+    pub additional_patchsets: &'a [String],
 }
 
 // public api
@@ -1437,9 +1577,11 @@ impl Composer {
             file_path,
             language,
             as_name,
-            additional_imports,
             mut shader_defs,
+            additional_patchsets,
         } = desc;
+
+        let visibility_unsupported = self.get_visibility_unsupported_modules();
 
         // reject a module containing the DECORATION strings
         if let Some(decor) = self.check_decoration_regex.find(source) {
@@ -1456,13 +1598,31 @@ impl Composer {
         let substituted_source = self.sanitize_and_set_auto_bindings(source);
 
         let PreprocessorMetaData {
-            name: module_name,
-            mut imports,
+            module_name,
+            mut usages,
             mut effective_defs,
+            exports,
+            mut patchsets,
+            extensions,
             ..
         } = self
             .preprocessor
-            .get_preprocessor_metadata(&substituted_source, false)
+            .get_preprocessor_metadata(
+                as_name
+                    .clone()
+                    .and_then(|x| {
+                        x.split_once("::")
+                            .map(|(crate_name, _)| crate_name.to_string())
+                    })
+                    .as_deref(),
+                as_name.clone().as_deref(),
+                &self.module_exports,
+                &self.module_mappings,
+                &visibility_unsupported,
+                &substituted_source,
+                false,
+                language.clone(),
+            )
             .map_err(|inner| ComposerError {
                 inner,
                 source: ErrSource::Constructing {
@@ -1482,6 +1642,8 @@ impl Composer {
                 },
             });
         }
+        patchsets.extend(additional_patchsets.iter().cloned());
+
         let module_name = module_name.unwrap();
 
         debug!(
@@ -1489,27 +1651,29 @@ impl Composer {
             module_name, shader_defs
         );
 
-        // add custom imports
-        let additional_imports = additional_imports.to_vec();
-        imports.extend(
-            additional_imports
+        usages.extend(
+            extensions
                 .iter()
+                .chain(&patchsets)
                 .cloned()
-                .map(|def| ImportDefWithOffset {
-                    definition: def,
+                .map(|extension| UseDefWithOffset {
+                    definition: UseDefinition {
+                        module: extension,
+                        items: vec![],
+                    },
                     offset: 0,
                 }),
         );
 
-        for import in &imports {
+        for usage in &usages {
             // we require modules already added so that we can capture the shader_defs that may impact us by impacting our dependencies
             let module_set = self
                 .module_sets
-                .get(&import.definition.import)
+                .get(&usage.definition.module)
                 .ok_or_else(|| ComposerError {
-                    inner: ComposerErrorInner::ImportNotFound(
-                        import.definition.import.clone(),
-                        import.offset,
+                    inner: ComposerErrorInner::ModuleNotFound(
+                        usage.definition.module.clone(),
+                        usage.offset,
                     ),
                     source: ErrSource::Constructing {
                         path: file_path.to_owned(),
@@ -1539,18 +1703,53 @@ impl Composer {
             file_path: file_path.to_owned(),
             language,
             effective_defs: effective_defs.into_iter().collect(),
-            all_imports: imports.into_iter().map(|id| id.definition.import).collect(),
-            additional_imports,
+            all_usages: usages.into_iter().map(|id| id.definition.module).collect(),
+            additional_patchsets: additional_patchsets.to_vec(),
             shader_defs,
             module_index,
             modules: Default::default(),
+            preprocess_output: Default::default(),
+            crate_name: None,
+            default_visibility: Some(Visibility::Public),
         };
 
         // invalidate dependent modules if this module already exists
         self.remove_composable_module(&module_name);
 
+        for (symbol, possible_export) in exports.iter() {
+            for (export, visibility) in possible_export {
+                match export {
+                    Export::Use(module, canonical_name, _) => {
+                        let canonical_module =
+                            format!("{}::{}", module, canonical_name.as_ref().unwrap_or(symbol));
+                        let export_module = format!("{}::{}", module_set.name, symbol);
+                        if self.contains_module(&canonical_module) {
+                            self.module_mappings
+                                .entry(export_module)
+                                .or_default()
+                                .insert(canonical_module, visibility.clone());
+                        }
+                    }
+                    Export::Module => {
+                        let module = format!("{}::{}", module_set.name, symbol);
+                        self.module_mappings
+                            .entry(module.clone())
+                            .or_default()
+                            .insert(module.clone(), visibility.clone());
+                    }
+                    _ => (),
+                }
+            }
+        }
+        if let Some(visibility) = module_set.default_visibility {
+            self.module_mappings
+                .entry(module_name.clone())
+                .or_default()
+                .insert(module_name.to_string(), visibility.clone());
+        }
         self.module_sets.insert(module_name.clone(), module_set);
         self.module_index.insert(module_index, module_name.clone());
+        self.module_exports.insert(module_name.clone(), exports);
         Ok(self.module_sets.get(&module_name).unwrap())
     }
 
@@ -1559,10 +1758,13 @@ impl Composer {
     pub fn remove_composable_module(&mut self, module_name: &str) {
         // todo this could be improved by making effective defs an Option<HashSet> and populating on demand?
         let mut dependent_sets = Vec::new();
+        for (_, mappings) in self.module_mappings.iter_mut() {
+            let _ = mappings.shift_remove(module_name);
+        }
 
         if self.module_sets.remove(module_name).is_some() {
             dependent_sets.extend(self.module_sets.iter().filter_map(|(dependent_name, set)| {
-                if set.all_imports.contains(module_name) {
+                if set.all_usages.contains(module_name) {
                     Some(dependent_name.clone())
                 } else {
                     None
@@ -1572,6 +1774,116 @@ impl Composer {
 
         for dependent_set in dependent_sets {
             self.remove_composable_module(&dependent_set);
+        }
+    }
+
+    fn get_visibility_unsupported_modules(&self) -> HashSet<String> {
+        self.module_sets
+            .iter()
+            .filter_map(|(k, module)| match module.language {
+                ShaderLanguage::Wgsl => None,
+                ShaderLanguage::Glsl => Some(k.to_string()),
+            })
+            .collect()
+    }
+
+    fn preprocess_dependency_tree(
+        &mut self,
+        base_name: &str,
+        base_resolver: PreprocessResolver,
+        shader_defs: &HashMap<String, ShaderDefValue>,
+        module_exports: &mut HashMap<String, IndexMap<String, Vec<(Export, Visibility)>>>,
+        module_mappings: &mut HashMap<String, IndexMap<String, Visibility>>,
+    ) -> Result<PreprocessOutput, ComposerError> {
+        let mut modules_in_stack = HashSet::new();
+
+        let visibility_unsupported = self.get_visibility_unsupported_modules();
+        modules_in_stack.insert(base_name.to_string());
+        let mut resolver_stack = vec![base_resolver];
+        loop {
+            let mut current_resolver = resolver_stack.pop().unwrap();
+            let next =
+                current_resolver.next(module_exports, module_mappings, &visibility_unsupported);
+            match next.map_err(|inner| ComposerError {
+                inner,
+                source: ErrSource::Module {
+                    name: current_resolver.name().to_string(),
+                    offset: 0,
+                    defs: shader_defs.clone(),
+                },
+            })? {
+                preprocess::PreprocessStep::Done(result) => {
+                    if resolver_stack.is_empty() {
+                        return Ok(result);
+                    } else if let Some(mut module_set) =
+                        self.module_sets.remove(current_resolver.name())
+                    {
+                        if let Some(default_visiblity) = &module_set.default_visibility {
+                            module_mappings
+                                .entry(module_set.name.to_string())
+                                .or_default()
+                                .insert(module_set.name.to_string(), default_visiblity.clone());
+                        }
+                        module_set.insert_preprocess_output(&shader_defs, result.clone());
+                        self.module_sets
+                            .insert(current_resolver.name().to_string(), module_set);
+                    } else {
+                        panic!("ModuleSet {} Not Found", current_resolver.name());
+                    }
+                }
+                preprocess::PreprocessStep::Miss(preprocess::PreprocessMiss::MissingModules(
+                    modules,
+                )) => {
+                    let name = current_resolver.name().to_string();
+                    resolver_stack.push(current_resolver);
+                    for (module, offset) in modules {
+                        if let Some(mut module_set) = self.module_sets.remove(&module) {
+                            if let Some(default_visiblity) = &module_set.default_visibility {
+                                module_mappings
+                                    .entry(module_set.name.to_string())
+                                    .or_default()
+                                    .insert(module_set.name.to_string(), default_visiblity.clone());
+                            };
+                            if let Some(_) = module_set.get_preprocess_output(&shader_defs) {
+                                // TODO: This isn't very efficient.
+                                // Need a better way of repopulating module_export and module_mapping data
+                                module_set.remove_preprocess_output(&shader_defs);
+                            }
+                            if !modules_in_stack.contains(&module) {
+                                modules_in_stack.insert(module.to_string());
+                                let resolver = self.preprocessor.preprocess(
+                                    &module_set.sanitized_source,
+                                    &shader_defs,
+                                    module_set.language.clone(),
+                                    module_set.crate_name.clone(),
+                                    Some(module_set.name.to_string()),
+                                    &module_set.additional_patchsets,
+                                );
+                                resolver_stack.push(resolver);
+                            } else {
+                                return Err(ComposerError {
+                                    inner: ComposerErrorInner::ModuleNotFound(module, offset),
+                                    source: ErrSource::Module {
+                                        name,
+                                        offset,
+                                        defs: shader_defs.clone(),
+                                    },
+                                });
+                            }
+                            self.module_sets.insert(module.to_string(), module_set);
+                        } else {
+                            return Err(ComposerError {
+                                inner: ComposerErrorInner::ModuleNotFound(module, offset),
+                                source: ErrSource::Module {
+                                    name,
+                                    offset,
+                                    defs: shader_defs.clone(),
+                                },
+                            });
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1585,19 +1897,34 @@ impl Composer {
             file_path,
             shader_type,
             mut shader_defs,
-            additional_imports,
+            additional_patchsets,
         } = desc;
-
+        let visibility_unsupported = self.get_visibility_unsupported_modules();
         let sanitized_source = self.sanitize_and_set_auto_bindings(source);
 
+        // Question: Why is this running? Feels a bit wasteful as its doing many of the same things
+        // Maybe this should just get the shader defs?
         let PreprocessorMetaData {
-            name,
+            module_name: name,
             defines,
-            imports,
-            ..
+            usages,
+            exports,
+            mut patchsets,
+            extensions,
+            submodules,
+            effective_defs,
         } = self
             .preprocessor
-            .get_preprocessor_metadata(&sanitized_source, true)
+            .get_preprocessor_metadata(
+                None,
+                None,
+                &self.module_exports,
+                &self.module_mappings,
+                &visibility_unsupported,
+                &sanitized_source,
+                true,
+                desc.shader_type.into(),
+            )
             .map_err(|inner| ComposerError {
                 inner,
                 source: ErrSource::Constructing {
@@ -1606,18 +1933,19 @@ impl Composer {
                     offset: 0,
                 },
             })?;
-        shader_defs.extend(defines);
 
+        shader_defs.extend(defines);
+        patchsets.extend(additional_patchsets.to_vec());
         let name = name.unwrap_or_default();
 
-        // make sure imports have been added
+        // make sure usages have been added
         // and gather additional defs specified at module level
-        for (import_name, offset) in imports
+        for (usage_name, offset) in usages
             .iter()
-            .map(|id| (&id.definition.import, id.offset))
-            .chain(additional_imports.iter().map(|ai| (&ai.import, 0)))
+            .map(|id| (&id.definition.module, id.offset))
+            .chain(extensions.iter().chain(patchsets.iter()).map(|x| (x, 0)))
         {
-            if let Some(module_set) = self.module_sets.get(import_name) {
+            if let Some(module_set) = self.module_sets.get(usage_name) {
                 for (def, value) in &module_set.shader_defs {
                     if let Some(prior_value) = shader_defs.insert(def.clone(), *value) {
                         if prior_value != *value {
@@ -1636,7 +1964,7 @@ impl Composer {
                 }
             } else {
                 return Err(ComposerError {
-                    inner: ComposerErrorInner::ImportNotFound(import_name.clone(), offset),
+                    inner: ComposerErrorInner::ModuleNotFound(usage_name.clone(), offset),
                     source: ErrSource::Constructing {
                         path: file_path.to_owned(),
                         source: sanitized_source,
@@ -1645,41 +1973,81 @@ impl Composer {
                 });
             }
         }
-        self.ensure_imports(
-            imports.iter().map(|import| &import.definition),
+
+        let mut module_exports = HashMap::default();
+        let mut module_mapping = HashMap::default();
+
+        let base_preprocessor_resolver = self.preprocessor.preprocess(
+            &sanitized_source,
             &shader_defs,
+            shader_type.into(),
+            None,
+            if name.is_empty() {
+                None
+            } else {
+                Some(name.to_string())
+            },
+            additional_patchsets,
+        );
+        let preprocess_output = self.preprocess_dependency_tree(
+            &name,
+            base_preprocessor_resolver,
+            &shader_defs,
+            &mut module_exports,
+            &mut module_mapping,
         )?;
-        self.ensure_imports(additional_imports, &shader_defs)?;
+
+        let source = preprocess_output.preprocessed_source.clone();
+
+        self.build_usages(
+            preprocess_output
+                .usages
+                .iter()
+                .map(|import| &import.definition),
+            &shader_defs,
+            &mut module_exports,
+            &mut module_mapping,
+        )?;
+        let extensions_and_patchsets: Vec<UseDefinition> = preprocess_output
+            .extensions
+            .iter()
+            .chain(preprocess_output.patchsets.iter())
+            .chain(additional_patchsets.iter())
+            .map(|module| UseDefinition {
+                module: module.to_string(),
+                items: vec![],
+            })
+            .collect();
+
+        self.build_usages(
+            &extensions_and_patchsets,
+            &shader_defs,
+            &mut module_exports,
+            &mut module_mapping,
+        )?;
 
         let definition = ComposableModuleDefinition {
             name,
+            crate_name: None,
             sanitized_source: sanitized_source.clone(),
-            language: shader_type.into(),
+            language: shader_type.clone().into(),
             file_path: file_path.to_owned(),
             module_index: 0,
-            additional_imports: additional_imports.to_vec(),
+            additional_patchsets: additional_patchsets.to_vec(),
             // we don't care about these for creating a top-level module
             effective_defs: Default::default(),
-            all_imports: Default::default(),
+            all_usages: Default::default(),
             shader_defs: Default::default(),
             modules: Default::default(),
+            preprocess_output: HashMap::from_iter(
+                vec![(
+                    ModuleKey::from_members(&Default::default(), &[]),
+                    preprocess_output.clone(),
+                )]
+                .into_iter(),
+            ),
+            default_visibility: Some(Visibility::Public),
         };
-
-        let PreprocessOutput {
-            preprocessed_source,
-            imports,
-        } = self
-            .preprocessor
-            .preprocess(&sanitized_source, &shader_defs)
-            .map_err(|inner| ComposerError {
-                inner,
-                source: ErrSource::Constructing {
-                    path: file_path.to_owned(),
-                    source: sanitized_source,
-                    offset: 0,
-                },
-            })?;
-
         let composable = self
             .create_composable_module(
                 &definition,
@@ -1687,14 +2055,14 @@ impl Composer {
                 &shader_defs,
                 false,
                 false,
-                &preprocessed_source,
-                imports,
+                &preprocess_output,
+                &mut module_mapping,
             )
             .map_err(|e| ComposerError {
                 inner: e.inner,
                 source: ErrSource::Constructing {
                     path: definition.file_path.to_owned(),
-                    source: preprocessed_source.clone(),
+                    source: source.clone(),
                     offset: e.source.offset(),
                 },
             })?;
@@ -1702,17 +2070,27 @@ impl Composer {
         let mut derived = DerivedModule::default();
 
         let mut already_added = Default::default();
-        for import in &composable.imports {
-            self.add_import(
+        let used_patchsets = preprocess_output
+            .patchsets
+            .iter()
+            .map(|x| UseDefinition {
+                module: x.to_string(),
+                items: Default::default(),
+            })
+            .collect::<Vec<UseDefinition>>();
+
+        for usage in composable.usages.values().chain(used_patchsets.iter()) {
+            self.add_usage(
                 &mut derived,
-                import,
+                usage,
                 &shader_defs,
                 false,
                 &mut already_added,
+                preprocess_output.patchsets.contains(&usage.module),
             );
         }
 
-        Self::add_composable_data(&mut derived, &composable, None, 0, false);
+        Self::add_composable_data(&mut derived, &composable, None, 0, false, true);
 
         let stage = match shader_type {
             #[cfg(feature = "glsl")]
@@ -1725,14 +2103,16 @@ impl Composer {
         let mut entry_points = Vec::default();
         derived.set_shader_source(&composable.module_ir, 0);
         for ep in &composable.module_ir.entry_points {
-            let mapped_func = derived.localize_function(&ep.function);
-            entry_points.push(EntryPoint {
-                name: ep.name.clone(),
-                function: mapped_func,
-                stage: stage.unwrap_or(ep.stage),
-                early_depth_test: ep.early_depth_test,
-                workgroup_size: ep.workgroup_size,
-            });
+            if let Some((Export::Function(_), _)) = composable.exports.get(&ep.name) {
+                let mapped_func = derived.localize_function(&ep.function);
+                entry_points.push(EntryPoint {
+                    name: ep.name.clone(),
+                    function: mapped_func,
+                    stage: stage.unwrap_or(ep.stage),
+                    early_depth_test: ep.early_depth_test,
+                    workgroup_size: ep.workgroup_size,
+                });
+            }
         }
 
         let mut naga_module = naga::Module {
@@ -1741,21 +2121,22 @@ impl Composer {
         };
 
         // apply overrides
-        if !composable.override_functions.is_empty() {
+        if !composable.patch_functions.is_empty() {
             let mut redirect = Redirector::new(naga_module);
 
-            for (base_function, overrides) in composable.override_functions {
+            for (base_function, (patches, _)) in composable.patch_functions {
                 let mut omit = HashSet::default();
 
                 let mut original = base_function;
-                for replacement in overrides {
+
+                for replacement in patches {
                     let (_h_orig, _h_replace) = redirect
                         .redirect_function(&original, &replacement, &omit)
                         .map_err(|e| ComposerError {
                             inner: e.into(),
                             source: ErrSource::Constructing {
                                 path: file_path.to_owned(),
-                                source: preprocessed_source.clone(),
+                                source: source.clone(),
                                 offset: composable.start_offset,
                             },
                         })?;
@@ -1768,7 +2149,7 @@ impl Composer {
                 inner: e.into(),
                 source: ErrSource::Constructing {
                     path: file_path.to_owned(),
-                    source: preprocessed_source.clone(),
+                    source: source.clone(),
                     offset: composable.start_offset,
                 },
             })?;
@@ -1787,7 +2168,7 @@ impl Composer {
                             match module_index {
                                 0 => ErrSource::Constructing {
                                     path: file_path.to_owned(),
-                                    source: preprocessed_source.clone(),
+                                    source: source.clone(),
                                     offset: composable.start_offset,
                                 },
                                 _ => {
@@ -1810,7 +2191,7 @@ impl Composer {
                         }
                         None => ErrSource::Constructing {
                             path: file_path.to_owned(),
-                            source: preprocessed_source.clone(),
+                            source: source.clone(),
                             offset: composable.start_offset,
                         },
                     };
@@ -1830,26 +2211,52 @@ impl Composer {
 static PREPROCESSOR: once_cell::sync::Lazy<Preprocessor> =
     once_cell::sync::Lazy::new(Preprocessor::default);
 
-/// Get module name and all required imports (ignoring shader_defs) from a shader string
+/// Get module name and all required usages (ignoring shader_defs) from a shader string
 pub fn get_preprocessor_data(
     source: &str,
+    language: ShaderLanguage,
+    module_exports: &HashMap<String, IndexMap<String, Vec<(Export, Visibility)>>>,
+    module_mapping: &HashMap<String, IndexMap<String, Visibility>>,
+    visibility_unsupported_modules: &HashSet<String>,
 ) -> (
     Option<String>,
-    Vec<ImportDefinition>,
+    Vec<UseDefinition>,
     HashMap<String, ShaderDefValue>,
 ) {
     if let Ok(PreprocessorMetaData {
-        name,
-        imports,
+        module_name: name,
+        usages,
+        extensions,
+        patchsets,
         defines,
         ..
-    }) = PREPROCESSOR.get_preprocessor_metadata(source, true)
-    {
+    }) = PREPROCESSOR.get_preprocessor_metadata(
+        None,
+        None,
+        module_exports,
+        module_mapping,
+        visibility_unsupported_modules,
+        source,
+        true,
+        language,
+    ) {
         (
             name,
-            imports
+            usages
                 .into_iter()
                 .map(|import_with_offset| import_with_offset.definition)
+                .chain(extensions.iter().map(|x| UseDefinition {
+                    module: x.to_string(),
+                    items: vec![],
+                }))
+                .chain(extensions.iter().map(|x| UseDefinition {
+                    module: x.to_string(),
+                    items: vec![],
+                }))
+                .chain(patchsets.iter().map(|x| UseDefinition {
+                    module: x.to_string(),
+                    items: vec![],
+                }))
                 .collect(),
             defines,
         )

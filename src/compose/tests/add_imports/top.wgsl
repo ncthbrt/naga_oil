@@ -1,5 +1,5 @@
-#import overridable
+use overridable
 
-fn entry_point() -> f32 {
+pub fn entry_point() -> f32 {
     return overridable::func();
 }

@@ -1,5 +1,5 @@
 #import mod
 
-fn main() -> f32 {
+pub fn main() -> f32 {
     return mod::f();
 }

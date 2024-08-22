@@ -20,6 +20,13 @@ impl<'a> Token<'a> {
             _ => None,
         }
     }
+
+    pub fn other(&self) -> Option<&char> {
+        match self {
+            Token::Other(other, _) => Some(other),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
