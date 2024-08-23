@@ -4,3 +4,8 @@ bevy_target.jpg
 import_example.png
 override.png
 out.txt
+
+# MSVC Windows builds of rustc generate these, which store debugging information
+*.pdb
+
+.DS_Store
