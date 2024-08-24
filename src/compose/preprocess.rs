@@ -480,10 +480,10 @@ impl<'a> PreprocessResolver<'a> {
             usage_lines.push('\n');
 
             self.final_string.push('\n');
-            self.current_line += 1;
             if open_count == 0 || self.lines.get(self.current_line + 1).is_none() {
                 break;
             }
+            self.current_line += 1;
         }
 
         self.offset += 1;
