@@ -393,6 +393,7 @@ pub struct UseDefWithOffset {
 pub struct Composer {
     pub validate: bool,
     pub module_sets: HashMap<String, ComposableModuleDefinition>,
+    pub crates: HashSet<String>,
     pub module_exports: HashMap<String, IndexMap<String, Vec<(Export, Visibility)>>>,
     pub module_mappings: HashMap<String, IndexMap<String, Visibility>>,
     pub module_index: HashMap<usize, String>,
@@ -400,8 +401,6 @@ pub struct Composer {
     preprocessor: Preprocessor,
     check_decoration_regex: Regex,
     undecorate_regex: Regex,
-    virtual_fn_regex: Regex,
-    patch_fn_regex: Regex,
     undecorate_patch_regex: Regex,
     auto_binding_regex: Regex,
     auto_binding_index: u32,
@@ -441,19 +440,6 @@ impl Default for Composer {
                 .as_str(),
             )
             .unwrap(),
-            virtual_fn_regex: Regex::new(
-                r"(?P<lead>[\s]*)(?P<virtual_keyword>virtual\s+)(?<fn_keyword>fn\s+)(?P<function_name>[^\s]+)(?P<trail>\s*)\(",
-            )
-            .unwrap(),
-            patch_fn_regex: Regex::new(
-                format!(
-                    r"(patch\s+fn\s+)(?P<target_function>[^\s]+){}(?P<target_module>[\w\d]+){}(?P<trail>\s*)\(",
-                    regex_syntax::escape(DECORATION_PRE),
-                    regex_syntax::escape(DECORATION_POST)
-                )
-                .as_str(),
-            )
-            .unwrap(),
             undecorate_patch_regex: Regex::new(
                 format!(
                     "{}([A-Z0-9]*){}",
@@ -464,16 +450,17 @@ impl Default for Composer {
             )
             .unwrap(),
             auto_binding_regex: Regex::new(r"@binding\(auto\)").unwrap(),
-            auto_binding_index: 0
+            auto_binding_index: 0,
+            crates: HashSet::new(),
         }
     }
 }
 
-const DECORATION_PRE: &str = "X_naga_oil_mod_X";
-const DECORATION_POST: &str = "X";
+pub const DECORATION_PRE: &str = "X_naga_oil_mod_X";
+pub const DECORATION_POST: &str = "X";
 
 // must be same length as DECORATION_PRE for spans to work
-const DECORATION_OVERRIDE_PRE: &str = "X_naga_oil_vrt_X";
+pub const DECORATION_OVERRIDE_PRE: &str = "X_naga_oil_vrt_X";
 
 struct IrBuildResult {
     module: naga::Module,
@@ -493,9 +480,14 @@ impl Composer {
         }
     }
 
-    fn decorate(module: &str) -> String {
+    pub fn decorate(module: &str) -> String {
         let encoded = data_encoding::BASE32_NOPAD.encode(module.as_bytes());
         format!("{DECORATION_PRE}{encoded}{DECORATION_POST}")
+    }
+
+    pub fn decorate_vrt(module: &str) -> String {
+        let encoded = data_encoding::BASE32_NOPAD.encode(module.as_bytes());
+        format!("{DECORATION_OVERRIDE_PRE}{encoded}{DECORATION_POST}")
     }
 
     /// Shorthand for creating a naga validator.
@@ -685,7 +677,6 @@ impl Composer {
             trace!("with defs {:?}", shader_defs);
             let module = import_module_set.get_module(shader_defs).unwrap();
             trace!("ok");
-
             // gather patches
             if !module.patch_functions.is_empty() {
                 for (original, (replacements, visibility)) in &module.patch_functions {
@@ -947,117 +938,38 @@ impl Composer {
             &preprocess_output.preprocessed_source.len()
         );
 
-        let wrap_err = |inner: ComposerErrorInner| -> ComposerError {
-            ComposerError {
-                inner,
-                source: ErrSource::Module {
-                    name: module_definition.name.to_owned(),
-                    offset: 0,
-                    defs: shader_defs.clone(),
-                },
-            }
-        };
+        let source = preprocess_output.preprocessed_source.clone();
 
-        // record virtual/overridable functions
-        let mut virtual_functions: HashMap<String, Visibility> = Default::default();
-        let source = self.virtual_fn_regex.replace_all(
-            &preprocess_output.preprocessed_source,
-            |cap: &regex::Captures| {
-                let function_name = cap.name("function_name").unwrap().as_str();
-
-                let lead = cap.name("lead").unwrap().as_str();
-                let trail = cap.name("trail").unwrap().as_str();
-                let fn_keyword = cap.name("fn_keyword").unwrap().as_str();
-
-                let replacement_str = format!("{lead}{fn_keyword}{function_name}{trail}(");
-                if let Some((Export::Function(OverrideMode::Virtual), visibility)) =
-                    preprocess_output.exports.get(function_name)
-                {
-                    virtual_functions.insert(function_name.to_string(), visibility.clone());
+        let virtual_functions: HashMap<String, Visibility> = preprocess_output
+            .exports
+            .iter()
+            .filter(|(_, (export, _))| {
+                if let Export::Function(OverrideMode::Virtual) = export {
+                    true
+                } else {
+                    false
                 }
-                replacement_str
-            },
-        );
-        // record and rename override functions
+            })
+            .map(|(symbol, (_, visibility))| (symbol.to_string(), visibility.clone()))
+            .collect();
+
+        // record and rename patch functions
         let mut local_patch_functions: IndexMap<String, (String, Option<Visibility>)> =
             Default::default();
 
-        #[cfg(not(feature = "patch_any"))]
-        let mut patch_error = None;
-        let source = if module_definition.language == ShaderLanguage::Wgsl {
-            self.patch_fn_regex
-                .replace_all(&source, |cap: &regex::Captures| {
-                    let target_module = cap.name("target_module").unwrap().as_str().to_owned();
-                    let target_function = cap.name("target_function").unwrap().as_str().to_owned();
-                    let base_name = format!(
-                        "{}{}{}{}",
-                        target_function.as_str(),
-                        DECORATION_PRE,
-                        target_module.as_str(),
-                        DECORATION_POST,
-                    );
-                    let rename = format!(
-                        "{}{}{}{}",
-                        target_function.as_str(),
-                        DECORATION_OVERRIDE_PRE,
-                        target_module.as_str(),
-                        DECORATION_POST,
-                    );
+        for (target_module, target_func) in preprocess_output.patches.iter() {
+            // TODO: Improve error reporting and preservation of spans
+            let base_name = Self::decorated_name(Some(target_module), target_func);
+            let rename = format!("{}{}", target_func, Self::decorate_vrt(target_module));
 
-                    let raw_module_name = decode(&target_module);
-
-                    let visibility = if let Some((_, visibility)) = preprocess_output
-                        .exports
-                        .get(&format!("{}::{target_function}", raw_module_name))
-                    {
-                        Some(visibility.clone())
-                    } else {
-                        None
-                    };
-
-                    #[cfg(not(feature = "patch_any"))]
-                    {
-                        // ensure overrides are applied to virtual functions
-                        let module_set = self.module_sets.get(&raw_module_name);
-
-                        match module_set {
-                            None => {
-                                // TODO this should be unreachable?
-                                let pos = cap.name("target_module").unwrap().start();
-                                patch_error = Some(wrap_err(ComposerErrorInner::ModuleNotFound(
-                                    raw_module_name,
-                                    pos,
-                                )));
-                            }
-                            Some(module_set) => {
-                                let module = module_set.get_module(shader_defs).unwrap();
-                                if !module.virtual_functions.contains_key(&target_function) {
-                                    let pos = cap.name("target_function").unwrap().start();
-                                    patch_error =
-                                        Some(wrap_err(ComposerErrorInner::PatchNotVirtual {
-                                            name: target_function.clone(),
-                                            pos,
-                                        }));
-                                }
-                            }
-                        }
-                    }
-
-                    let replacement_str =
-                        format!("fn {}{}(", rename, cap.name("trail").unwrap().as_str());
-
-                    local_patch_functions.insert(rename, (base_name, visibility));
-
-                    replacement_str
-                })
-                .to_string()
-        } else {
-            source.to_string()
-        };
-
-        #[cfg(not(feature = "patch_any"))]
-        if let Some(err) = patch_error {
-            return Err(err);
+            if let Some((_, visibility)) = preprocess_output
+                .exports
+                .get(&format!("{target_module}::{target_func}"))
+            {
+                local_patch_functions.insert(rename, (base_name, Some(visibility.clone())));
+            } else {
+                local_patch_functions.insert(rename, (base_name, None));
+            }
         }
 
         trace!("local patches: {:?}", local_patch_functions);
@@ -1074,7 +986,7 @@ impl Composer {
             mut patch_functions,
         } = self.create_module_ir(
             &module_definition.name,
-            source,
+            source.to_string(),
             module_definition.language,
             &usages,
             &preprocess_output.patchsets,
@@ -1137,7 +1049,7 @@ impl Composer {
         let mut owned_functions = IndexMap::new();
         for (h_f, f) in source_ir.functions.iter_mut() {
             if let Some(name) = f.name.as_mut() {
-                if !name.contains(DECORATION_PRE) {
+                if !name.contains(DECORATION_PRE) || local_patch_functions.contains_key(name) {
                     *name = format!("{name}{module_decoration}");
                     // create dummy header function
                     let header_function = naga::Function {
@@ -1608,14 +1520,8 @@ impl Composer {
         } = self
             .preprocessor
             .get_preprocessor_metadata(
-                as_name
-                    .clone()
-                    .and_then(|x| {
-                        x.split_once("::")
-                            .map(|(crate_name, _)| crate_name.to_string())
-                    })
-                    .as_deref(),
-                as_name.clone().as_deref(),
+                &None,
+                &as_name,
                 &self.module_exports,
                 &self.module_mappings,
                 &visibility_unsupported,
@@ -1699,6 +1605,7 @@ impl Composer {
 
         let module_set = ComposableModuleDefinition {
             name: module_name.clone(),
+            crate_name: None,
             sanitized_source: substituted_source,
             file_path: file_path.to_owned(),
             language,
@@ -1709,7 +1616,6 @@ impl Composer {
             module_index,
             modules: Default::default(),
             preprocess_output: Default::default(),
-            crate_name: None,
             default_visibility: Some(Visibility::Public),
         };
 
@@ -1803,15 +1709,8 @@ impl Composer {
         loop {
             let mut current_resolver = resolver_stack.pop().unwrap();
             let next =
-                current_resolver.next(module_exports, module_mappings, &visibility_unsupported);
-            match next.map_err(|inner| ComposerError {
-                inner,
-                source: ErrSource::Module {
-                    name: current_resolver.name().to_string(),
-                    offset: 0,
-                    defs: shader_defs.clone(),
-                },
-            })? {
+                current_resolver.next(module_exports, module_mappings, &visibility_unsupported)?;
+            match next {
                 preprocess::PreprocessStep::Done(result) => {
                     if resolver_stack.is_empty() {
                         return Ok(result);
@@ -1853,10 +1752,11 @@ impl Composer {
                                 modules_in_stack.insert(module.to_string());
                                 let resolver = self.preprocessor.preprocess(
                                     &module_set.sanitized_source,
-                                    &shader_defs,
+                                    shader_defs,
                                     module_set.language.clone(),
                                     module_set.crate_name.clone(),
                                     Some(module_set.name.to_string()),
+                                    module_set.file_path.clone(),
                                     &module_set.additional_patchsets,
                                 );
                                 resolver_stack.push(resolver);
@@ -1908,16 +1808,14 @@ impl Composer {
             module_name: name,
             defines,
             usages,
-            exports,
             mut patchsets,
             extensions,
-            submodules,
-            effective_defs,
+            ..
         } = self
             .preprocessor
             .get_preprocessor_metadata(
-                None,
-                None,
+                &None,
+                &None,
                 &self.module_exports,
                 &self.module_mappings,
                 &visibility_unsupported,
@@ -1987,6 +1885,7 @@ impl Composer {
             } else {
                 Some(name.to_string())
             },
+            file_path.to_string(),
             additional_patchsets,
         );
         let preprocess_output = self.preprocess_dependency_tree(
@@ -2030,7 +1929,7 @@ impl Composer {
             name,
             crate_name: None,
             sanitized_source: sanitized_source.clone(),
-            language: shader_type.clone().into(),
+            language: shader_type.into(),
             file_path: file_path.to_owned(),
             module_index: 0,
             additional_patchsets: additional_patchsets.to_vec(),
@@ -2039,13 +1938,10 @@ impl Composer {
             all_usages: Default::default(),
             shader_defs: Default::default(),
             modules: Default::default(),
-            preprocess_output: HashMap::from_iter(
-                vec![(
-                    ModuleKey::from_members(&Default::default(), &[]),
-                    preprocess_output.clone(),
-                )]
-                .into_iter(),
-            ),
+            preprocess_output: HashMap::from_iter(vec![(
+                ModuleKey::from_members(&Default::default(), &[]),
+                preprocess_output.clone(),
+            )]),
             default_visibility: Some(Visibility::Public),
         };
         let composable = self
@@ -2231,8 +2127,8 @@ pub fn get_preprocessor_data(
         defines,
         ..
     }) = PREPROCESSOR.get_preprocessor_metadata(
-        None,
-        None,
+        &None,
+        &None,
         module_exports,
         module_mapping,
         visibility_unsupported_modules,

@@ -1,4 +1,4 @@
-error: patch is invalid as `outer` is not virtual (this error can be disabled with feature 'patch_any')
+error: patch is invalid as `mod::outer` is not virtual (this error can be disabled with feature 'patch_any')
   ┌─ tests/overrides/top_invalid.wgsl:3:14
   │
 3 │ pub patch fn mod::outer() -> f32 {

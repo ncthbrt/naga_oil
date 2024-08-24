@@ -276,7 +276,7 @@ impl<'a> DerivedModule<'a> {
 
     // remap a pipeline override from source context into our derived context
     pub fn import_pipeline_override(&mut self, h_override: &Handle<Override>) -> Handle<Override> {
-        self.rename_pipeline_override(&h_override, None)
+        self.rename_pipeline_override(h_override, None)
     }
 
     // remap a block

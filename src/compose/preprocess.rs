@@ -1,21 +1,22 @@
 use std::{
-    borrow::Cow,
+    borrow::{Borrow, Cow},
     collections::{HashMap, HashSet},
     sync::Arc,
 };
 
 use indexmap::{IndexMap, IndexSet};
-use regex::{Match, Regex};
+use regex::{bytes::Captures, Match, Regex};
 
 use crate::compose::OverrideMode;
 
 use super::{
     comment_strip_iter::CommentReplaceExt,
     parse_usages::{
-        gather_direct_usages, parse_uses, substitute_with_canonical_identifiers, UsageFault,
+        self, canonicalize_usage, gather_direct_usages, parse_uses,
+        substitute_with_canonical_identifiers, UsageFault,
     },
-    ComposerErrorInner, Export, ShaderDefValue, ShaderLanguage, UseBehaviour, UseDefWithOffset,
-    Visibility,
+    Composer, ComposerError, ComposerErrorInner, ErrSource, Export, ShaderDefValue, ShaderLanguage,
+    UseBehaviour, UseDefWithOffset, UseDefinition, Visibility,
 };
 
 #[derive(Debug)]
@@ -80,7 +81,7 @@ impl Default for Preprocessor {
             )
             .unwrap(),
             pub_override_regex: Regex::new(
-                    r"(?P<lead>\s*)(?P<pub_keyword>pub\s+)(?P<override_keyword>override\s+)((?P<fn_keyword>fn\s+)|(?P<target_override>[^\s:]+))",
+                    r"(?P<lead>\s*)(?P<pub_keyword>pub\s+)(?P<override_keyword>override\s+)(?P<target_override>[^\s:]+)",
             )
             .unwrap(),
             })
@@ -274,6 +275,7 @@ pub struct PreprocessOutput {
     pub patchsets: IndexSet<String>,
     pub extensions: IndexSet<String>,
     pub usages: Vec<UseDefWithOffset>,
+    pub patches: Vec<(String, String)>,
 }
 
 #[derive(Debug)]
@@ -287,6 +289,7 @@ enum PreprocessState {
         usage_lines: String,
     },
     ProcessForcedPatchsets,
+    CanonicalizingPatches,
     StartProcessingIdentifierSubstitution,
     ProcessIdentifierSubstitution,
     SubstituteIdentifiers {
@@ -304,10 +307,14 @@ pub struct PreprocessResolver<'a> {
     language: ShaderLanguage,
     crate_name: Option<String>,
     module_name: Option<String>,
+    module_path: String,
     regexes: Arc<PreprocessorRegexes>,
+    original_string: String,
     final_string: String,
     offset: usize,
     patchsets: IndexSet<String>,
+    processed_patches: Vec<(String, String)>,
+    unprocessed_patches: Vec<(String, usize)>,
     extensions: IndexSet<String>,
     forced_patchsets: IndexSet<String>,
     usages: IndexMap<String, UseDefWithOffset>,
@@ -328,17 +335,33 @@ pub enum PreprocessStep {
     Miss(PreprocessMiss),
 }
 
+fn map_err(inner: ComposerErrorInner, source: ErrSource) -> ComposerError {
+    ComposerError { inner, source }
+}
+
 impl<'a> PreprocessResolver<'a> {
     pub fn name(&self) -> &str {
         self.module_name.as_deref().unwrap_or_default()
     }
 
-    fn process_directives(&mut self) -> Result<(), ComposerErrorInner> {
+    pub fn original_source(&self) -> &str {
+        &self.original_string
+    }
+
+    fn process_directives(&mut self) -> Result<(), ComposerError> {
         while let Some((line, original_line)) = self.lines.get(self.current_line).cloned() {
+            let mut output = false;
             if let Some(cap) = self.regexes.version_regex.captures(&line) {
                 let v = cap.get(1).unwrap().as_str();
                 if v != "440" && v != "450" {
-                    return Err(ComposerErrorInner::GlslInvalidVersion(self.offset));
+                    return Err(map_err(
+                        ComposerErrorInner::GlslInvalidVersion(self.offset),
+                        ErrSource::Module {
+                            name: self.module_name.clone().unwrap_or_default(),
+                            offset: self.offset.clone(),
+                            defs: self.shader_defs.clone(),
+                        },
+                    ));
                 }
             } else if let Some(cap) = self.regexes.define_import_path_regex.captures(&line) {
                 self.module_name = self
@@ -351,7 +374,17 @@ impl<'a> PreprocessResolver<'a> {
                 &line,
                 Some(&mut self.scope),
                 self.offset,
-            )?
+            )
+            .map_err(|inner| {
+                map_err(
+                    inner,
+                    ErrSource::Constructing {
+                        path: self.module_path.to_string(),
+                        source: self.original_string.to_owned(),
+                        offset: self.offset,
+                    },
+                )
+            })?
             .0 || self
                 .regexes
                 .define_shader_def_regex
@@ -361,8 +394,8 @@ impl<'a> PreprocessResolver<'a> {
                 // ignore
             } else if self.scope.active() {
                 if self.regexes.use_regex.is_match(&line) {
-                    let _ = self.collect_usage_lines(&line);
-                    self.final_string.push_str(&line);
+                    let _ = self.collect_usage_lines();
+                    output = true;
                     // ignore
                 } else {
                     let mut replaced_line = original_line.to_string();
@@ -392,51 +425,68 @@ impl<'a> PreprocessResolver<'a> {
                     }
 
                     self.final_string.push_str(replaced_line.as_str());
+                    let diff = original_line.len().saturating_sub(replaced_line.len());
+                    self.final_string.extend(std::iter::repeat(" ").take(diff));
+                    self.offset += original_line.len() + 1;
+                    output = true;
                 }
             }
             self.current_line += 1;
 
-            // output spaces for removed lines to keep spans consistent (errors report against substituted_source, which is not preprocessed)
-            self.final_string
-                .extend(std::iter::repeat(" ").take(line.len()));
-            self.offset += line.len() + 1;
+            if !output {
+                // output spaces for removed lines to keep spans consistent (errors report against substituted_source, which is not preprocessed)
+                self.final_string
+                    .extend(std::iter::repeat(" ").take(original_line.len()));
+                self.offset += original_line.len() + 1;
+            }
             self.final_string.push('\n');
         }
 
-        self.scope.finish(self.offset)?;
+        self.scope.finish(self.offset).map_err(|inner| {
+            map_err(
+                inner,
+                ErrSource::Module {
+                    name: self.module_name.clone().unwrap_or_default(),
+                    offset: self.offset.clone(),
+                    defs: self.shader_defs.clone(),
+                },
+            )
+        })?;
         self.state = PreprocessState::DiscoveringSubmodulesAndExports;
-
+        debug_assert_eq!(self.original_string.len(), self.offset);
         Ok(())
     }
 
-    fn collect_usage_lines(&mut self, line: &str) -> String {
+    fn collect_usage_lines(&mut self) -> String {
         let mut usage_lines = String::default();
         let mut open_count = 0;
 
         loop {
             // output spaces for removed lines to keep spans consistent (errors report against substituted_source, which is not preprocessed)
+            let (current_line, current_original_line) = &self.lines[self.current_line];
             self.final_string
-                .extend(std::iter::repeat(" ").take(line.len()));
-            self.offset += line.len() + 1;
+                .extend(std::iter::repeat(" ").take(current_original_line.len()));
+            self.offset += current_original_line.len() + 1;
 
             // PERF: Ideally we don't do multiple `match_indices` passes over `line`
             // in addition to the final pass for the import parse
-            open_count += line.match_indices('{').count();
-            open_count = open_count.saturating_sub(line.match_indices('}').count());
+            open_count += current_line.match_indices('{').count();
+            open_count = open_count.saturating_sub(current_line.match_indices('}').count());
 
             // PERF: it's bad that we allocate here. ideally we would use something like
             //     let import_lines = &shader_str[initial_offset..offset]
             // but we need the comments removed, and the iterator approach doesn't make that easy
-            usage_lines.push_str(&line);
+            usage_lines.push_str(&current_line);
             usage_lines.push('\n');
-
-            if open_count == 0 || self.lines.get(self.current_line + 1).is_none() {
-                break;
-            }
 
             self.final_string.push('\n');
             self.current_line += 1;
+            if open_count == 0 || self.lines.get(self.current_line + 1).is_none() {
+                break;
+            }
         }
+
+        self.offset += 1;
 
         usage_lines
     }
@@ -446,7 +496,7 @@ impl<'a> PreprocessResolver<'a> {
         module_exports: &mut HashMap<String, IndexMap<String, Vec<(Export, Visibility)>>>,
         module_mappings: &mut HashMap<String, IndexMap<String, Visibility>>,
         visibility_unsupported_modules: &HashSet<String>,
-    ) -> Result<PreprocessStep, ComposerErrorInner> {
+    ) -> Result<PreprocessStep, ComposerError> {
         'processor: loop {
             match &self.state {
                 PreprocessState::Initial => {
@@ -454,11 +504,17 @@ impl<'a> PreprocessResolver<'a> {
                     continue 'processor;
                 }
                 PreprocessState::DiscoveringSubmodulesAndExports => {
-                    let (final_string, exports, submodules) = parse_exports_and_submodules(
+                    let ParseExportsAndSubmodulesOutput {
+                        final_string,
+                        exports,
+                        submodules,
+                        patches,
+                    } = parse_exports_and_submodules(
                         &self.regexes,
                         self.language,
                         &self.final_string,
-                    );
+                    )?;
+                    self.unprocessed_patches = patches;
                     self.final_string = final_string;
                     self.submodules.extend(submodules.into_iter());
                     let module_name = self.module_name.clone().unwrap_or_default();
@@ -469,7 +525,14 @@ impl<'a> PreprocessResolver<'a> {
                     for (symbol, symbol_export) in exports {
                         if symbol_export.len() > 1 {
                             // TODO: Add better error handling (specifically include symbol offsets)
-                            return Err(ComposerErrorInner::AmbiguousExportError(symbol));
+                            return Err(map_err(
+                                ComposerErrorInner::AmbiguousExportError(symbol),
+                                ErrSource::Module {
+                                    name: self.module_name.clone().unwrap_or_default(),
+                                    offset: self.offset.clone(),
+                                    defs: self.shader_defs.clone(),
+                                },
+                            ));
                         } else {
                             let export = symbol_export.first().unwrap().clone();
                             if let (Export::Module, visibility) = &export {
@@ -513,10 +576,8 @@ impl<'a> PreprocessResolver<'a> {
                         self.lines.get(self.current_line).cloned()
                     {
                         if self.regexes.use_regex.is_match(&line) {
-                            let initial_offset = 0;
-                            let usage_lines = self.collect_usage_lines(&line);
-                            self.final_string
-                                .push_str(&" ".repeat(usage_lines.len() - 1));
+                            let initial_offset = self.offset;
+                            let usage_lines = self.collect_usage_lines();
                             self.state = PreprocessState::ParsingUseStatement {
                                 usage_lines: usage_lines.clone(),
                                 initial_offset: initial_offset.clone(),
@@ -540,8 +601,8 @@ impl<'a> PreprocessResolver<'a> {
                         module_exports,
                         module_mappings,
                         visibility_unsupported_modules,
-                        self.crate_name.as_deref(),
-                        self.module_name.as_deref(),
+                        &self.crate_name,
+                        &self.module_name,
                         &mut declared_usages,
                         &mut self.extensions,
                         &mut self.patchsets,
@@ -602,16 +663,40 @@ impl<'a> PreprocessResolver<'a> {
                                     .collect(),
                             )));
                         }
-                        Err(UsageFault::Error(err)) => {
-                            return Err(ComposerErrorInner::UsageParseError(
-                                err.to_owned(),
-                                initial_offset.clone(),
+                        Err(UsageFault::UsageParseError(err)) => {
+                            return Err(map_err(
+                                ComposerErrorInner::UsageParseError(
+                                    err.to_owned(),
+                                    initial_offset.clone(),
+                                ),
+                                ErrSource::Module {
+                                    name: self.module_name.clone().unwrap_or_default(),
+                                    offset: self.offset.clone(),
+                                    defs: self.shader_defs.clone(),
+                                },
                             ));
                         }
-                        Err(UsageFault::ErrorWithOffset(err, additional_offset)) => {
-                            return Err(ComposerErrorInner::UsageParseError(
-                                err.to_owned(),
-                                initial_offset + additional_offset,
+                        Err(UsageFault::UsageParseErrorWithOffset(err, additional_offset)) => {
+                            return Err(map_err(
+                                ComposerErrorInner::UsageParseError(
+                                    err.to_owned(),
+                                    initial_offset + additional_offset,
+                                ),
+                                ErrSource::Module {
+                                    name: self.module_name.clone().unwrap_or_default(),
+                                    offset: self.offset.clone(),
+                                    defs: self.shader_defs.clone(),
+                                },
+                            ));
+                        }
+                        Err(UsageFault::ComposerError(err)) => {
+                            return Err(map_err(
+                                err,
+                                ErrSource::Module {
+                                    name: self.module_name.clone().unwrap_or_default(),
+                                    offset: self.offset.clone(),
+                                    defs: self.shader_defs.clone(),
+                                },
                             ));
                         }
                     };
@@ -625,7 +710,10 @@ impl<'a> PreprocessResolver<'a> {
                     let unprocessed_patchsets: Vec<(String, usize)> = self
                         .forced_patchsets
                         .iter()
-                        .filter(|x| !module_mappings.contains_key(x.as_str()))
+                        .filter(|x| {
+                            !module_mappings.contains_key(x.as_str())
+                                || !module_exports.contains_key(x.as_str())
+                        })
                         .cloned()
                         .map(|x| (x, 0))
                         .collect();
@@ -635,7 +723,162 @@ impl<'a> PreprocessResolver<'a> {
                             unprocessed_patchsets,
                         )));
                     }
+                    self.state = PreprocessState::CanonicalizingPatches;
                     continue 'processor;
+                }
+                PreprocessState::CanonicalizingPatches => {
+                    for (idx, (patch, offset)) in self
+                        .unprocessed_patches
+                        .clone()
+                        .iter_mut()
+                        .enumerate()
+                        .rev()
+                    {
+                        let full_paths = parse_usages::get_full_paths(
+                            patch,
+                            &self.declared_usages,
+                            &self.crate_name,
+                            &self.module_name,
+                            &self.submodules,
+                        );
+
+                        if full_paths.len() > 1 {
+                            return Err(map_err(
+                                ComposerErrorInner::UsageParseError(
+                                    "Ambiguous paths".to_string(),
+                                    *offset,
+                                ),
+                                ErrSource::Module {
+                                    name: self.name().to_string(),
+                                    offset: *offset,
+                                    defs: self.shader_defs.clone(),
+                                },
+                            ));
+                        }
+
+                        if let Some((module, func)) = patch.rsplit_once("::") {
+                            let mut result = Default::default();
+                            match canonicalize_usage(
+                                module_exports,
+                                module_mappings,
+                                visibility_unsupported_modules,
+                                &self.module_name,
+                                module,
+                                func,
+                                false,
+                                &mut result,
+                            ) {
+                                Ok(_) => {
+                                    let (canonical_module, canonical_item, export) =
+                                        result.first().unwrap();
+                                    #[cfg(not(feature = "patch_any"))]
+                                    {
+                                        if let Some(Export::Function(OverrideMode::Virtual)) =
+                                            export
+                                        {
+                                        } else {
+                                            return Err(map_err(
+                                                ComposerErrorInner::PatchNotVirtual {
+                                                    name: format!("{module}::{func}"),
+                                                    pos: *offset,
+                                                },
+                                                ErrSource::Constructing {
+                                                    path: self.module_path.to_owned(),
+                                                    source: self.original_string.to_owned(),
+                                                    offset: *offset,
+                                                },
+                                            ));
+                                        }
+                                    }
+                                    if let Some(export) = self.exports.shift_remove(patch) {
+                                        self.exports.insert(
+                                            format!("{canonical_module}::{canonical_item}"),
+                                            export,
+                                        );
+                                    }
+                                    self.unprocessed_patches.remove(idx);
+                                    self.processed_patches.push((
+                                        canonical_module.to_string(),
+                                        canonical_item.to_string(),
+                                    ));
+                                    let fn_regex = Regex::new(&format!("(?P<lead>\\s*)(?P<fn_keyword>fn\\s+)(?<target>{})(?P<trail>\\s*)\\(", patch)).unwrap();
+                                    self.final_string = fn_regex
+                                        .replace_all(&self.final_string, |cap: &regex::Captures| {
+                                            let rename = format!(
+                                                "{}{}",
+                                                canonical_item,
+                                                Composer::decorate_vrt(canonical_module)
+                                            );
+                                            format!(
+                                                "{}{}{}{}(",
+                                                cap.name("lead").unwrap().as_str(),
+                                                cap.name("fn_keyword").unwrap().as_str(),
+                                                rename,
+                                                cap.name("trail").unwrap().as_str()
+                                            )
+                                        })
+                                        .to_string();
+                                    self.usages
+                                        .entry(canonical_module.to_string())
+                                        .or_insert(UseDefWithOffset {
+                                            definition: UseDefinition {
+                                                module: canonical_module.clone(),
+                                                items: vec![],
+                                            },
+                                            offset: 0,
+                                        })
+                                        .definition
+                                        .items
+                                        .push(canonical_item.to_string());
+                                    Ok(())
+                                }
+                                Err(UsageFault::UsageParseError(err)) => Err(map_err(
+                                    ComposerErrorInner::UsageParseError(err, 0),
+                                    ErrSource::Constructing {
+                                        path: self.module_path.to_owned(),
+                                        source: self.original_string.to_owned(),
+                                        offset: *offset,
+                                    },
+                                )),
+                                Err(UsageFault::UsageParseErrorWithOffset(err, offset)) => {
+                                    Err(map_err(
+                                        ComposerErrorInner::UsageParseError(err, offset),
+                                        ErrSource::Constructing {
+                                            path: self.module_path.to_owned(),
+                                            source: self.original_string.to_owned(),
+                                            offset,
+                                        },
+                                    ))
+                                }
+                                Err(UsageFault::MissingModules(modules)) => {
+                                    return Ok(PreprocessStep::Miss(
+                                        PreprocessMiss::MissingModules(modules),
+                                    ))
+                                }
+                                Err(UsageFault::ComposerError(err)) => Err(map_err(
+                                    err,
+                                    ErrSource::Module {
+                                        name: self.module_name.clone().unwrap_or_default(),
+                                        offset: self.offset.clone(),
+                                        defs: self.shader_defs.clone(),
+                                    },
+                                )),
+                            }?;
+                        } else {
+                            return Err(map_err(
+                                ComposerErrorInner::UsageParseError(
+                                    format!("patch {} needs to have a module in scope", patch),
+                                    0,
+                                ),
+                                ErrSource::Module {
+                                    name: self.module_name.clone().unwrap_or_default(),
+                                    offset: self.offset.clone(),
+                                    defs: self.shader_defs.clone(),
+                                },
+                            ));
+                        }
+                    }
+                    self.state = PreprocessState::StartProcessingIdentifierSubstitution;
                 }
                 PreprocessState::StartProcessingIdentifierSubstitution => {
                     self.lines = self
@@ -666,8 +909,10 @@ impl<'a> PreprocessResolver<'a> {
                         patchsets: self.patchsets.clone(),
                         extensions: self.extensions.clone(),
                         usages: self.usages.values().cloned().collect(),
+                        patches: self.processed_patches.clone(),
                     };
                     self.state = PreprocessState::Done(output);
+
                     continue 'processor;
                 }
                 PreprocessState::SubstituteIdentifiers {
@@ -678,8 +923,9 @@ impl<'a> PreprocessResolver<'a> {
                     let item_replaced_line = substitute_with_canonical_identifiers(
                         original_line,
                         self.offset,
-                        self.crate_name.as_deref(),
-                        self.module_name.as_deref(),
+                        &self.crate_name,
+                        &self.module_name,
+                        &self.submodules,
                         &module_exports,
                         &module_mappings,
                         &visibility_unsupported_modules,
@@ -692,8 +938,9 @@ impl<'a> PreprocessResolver<'a> {
                     match substitute_with_canonical_identifiers(
                         decommented_line,
                         self.offset,
-                        self.crate_name.as_deref(),
-                        self.module_name.as_deref(),
+                        &self.crate_name,
+                        &self.module_name,
+                        &self.submodules,
                         &module_exports,
                         &module_mappings,
                         &visibility_unsupported_modules,
@@ -707,16 +954,40 @@ impl<'a> PreprocessResolver<'a> {
                                 modules,
                             )));
                         }
-                        Err(UsageFault::Error(err)) => {
-                            return Err(ComposerErrorInner::UsageParseError(
-                                err.to_owned(),
-                                self.offset.clone(),
+                        Err(UsageFault::UsageParseError(err)) => {
+                            return Err(map_err(
+                                ComposerErrorInner::UsageParseError(
+                                    err.to_owned(),
+                                    self.offset.clone(),
+                                ),
+                                ErrSource::Constructing {
+                                    path: self.module_path.to_owned(),
+                                    source: self.original_string.to_owned(),
+                                    offset: self.offset,
+                                },
                             ));
                         }
-                        Err(UsageFault::ErrorWithOffset(err, additional_offset)) => {
-                            return Err(ComposerErrorInner::UsageParseError(
-                                err.to_owned(),
-                                self.offset + additional_offset,
+                        Err(UsageFault::UsageParseErrorWithOffset(err, additional_offset)) => {
+                            return Err(map_err(
+                                ComposerErrorInner::UsageParseError(
+                                    err.to_owned(),
+                                    self.offset + additional_offset,
+                                ),
+                                ErrSource::Constructing {
+                                    path: self.module_path.to_owned(),
+                                    source: self.original_string.to_owned(),
+                                    offset: self.offset,
+                                },
+                            ));
+                        }
+                        Err(UsageFault::ComposerError(err)) => {
+                            return Err(map_err(
+                                err,
+                                ErrSource::Constructing {
+                                    path: self.module_path.to_owned(),
+                                    source: self.original_string.to_owned(),
+                                    offset: self.offset,
+                                },
                             ));
                         }
                     };
@@ -738,17 +1009,21 @@ impl<'a> PreprocessResolver<'a> {
     }
 }
 
+struct ParseExportsAndSubmodulesOutput {
+    final_string: String,
+    exports: IndexMap<String, Vec<(Export, Visibility)>>,
+    submodules: IndexSet<String>,
+    patches: Vec<(String, usize)>,
+}
+
 // TODO: Make spans consistent
 fn parse_exports_and_submodules(
     regexes: &PreprocessorRegexes,
     language: ShaderLanguage,
     source: &str,
-) -> (
-    String,
-    IndexMap<String, Vec<(Export, Visibility)>>,
-    IndexSet<String>,
-) {
+) -> Result<ParseExportsAndSubmodulesOutput, ComposerError> {
     let mut exports: IndexMap<String, Vec<(Export, Visibility)>> = Default::default();
+    let mut patches: Vec<(String, usize)> = Default::default();
     let source = Cow::Borrowed(source);
     let source = if language == ShaderLanguage::Wgsl {
         regexes
@@ -756,14 +1031,20 @@ fn parse_exports_and_submodules(
             .replace_all(&source, |cap: &regex::Captures| {
                 let target_function = cap.name("target_function").unwrap().as_str();
 
-                let override_mode = if cap.name("virtual_keyword").is_some()
-                    || cap.name("override_keyword").is_some()
-                    || cap.name("patch_keyword").is_some()
+                let patch_cap = cap.name("patch_keyword");
+                let override_mode = if cap.name("virtual_keyword").is_some() || patch_cap.is_some()
                 {
                     OverrideMode::Virtual
                 } else {
                     OverrideMode::Static
                 };
+
+                if patch_cap.is_some() {
+                    patches.push((
+                        target_function.to_string(),
+                        cap.name("target_function").unwrap().start(),
+                    ));
+                }
 
                 exports
                     .entry(target_function.to_string())
@@ -775,18 +1056,19 @@ fn parse_exports_and_submodules(
                 format!(
                     "{}{}{}{}{}{}{}(",
                     cap.name("lead").unwrap().as_str(),
+                    " ".repeat(cap.name("pub_keyword").map(|x| x.as_str()).unwrap().len()),
                     " ".repeat(
-                        cap.name("pub_keyword")
+                        cap.name("patch_keyword")
                             .map(|x| x.as_str())
                             .unwrap_or_default()
                             .len()
                     ),
-                    cap.name("patch_keyword")
-                        .map(|x| x.as_str())
-                        .unwrap_or_default(),
-                    cap.name("virtual_keyword")
-                        .map(|x| x.as_str())
-                        .unwrap_or_default(),
+                    " ".repeat(
+                        cap.name("virtual_keyword")
+                            .map(|x| x.as_str())
+                            .unwrap_or_default()
+                            .len()
+                    ),
                     cap.name("fn_keyword").unwrap().as_str(),
                     target_function,
                     cap.name("trail").unwrap().as_str()
@@ -817,7 +1099,7 @@ fn parse_exports_and_submodules(
                     cap.name("var_keyword").unwrap().as_str(),
                     cap.name("var_arguments")
                         .map(|x| x.as_str())
-                        .unwrap_or(&" "),
+                        .unwrap_or_default(),
                     target_var
                 )
             })
@@ -907,21 +1189,6 @@ fn parse_exports_and_submodules(
         regexes
             .pub_override_regex
             .replace_all(&source, |cap: &regex::Captures| {
-                if cap.name("fn_keyword").is_some() {
-                    // ignore override functions. They'll be replaced later
-                    return format!(
-                        "{}{}{}{}",
-                        cap.name("lead").unwrap().as_str(),
-                        " ".repeat(
-                            cap.name("pub_keyword")
-                                .map(|x| x.as_str())
-                                .unwrap_or_default()
-                                .len()
-                        ),
-                        cap.name("override_keyword").unwrap().as_str(),
-                        cap.name("fn_keyword").unwrap().as_str(),
-                    );
-                }
                 let target_override = cap.name("target_alias").unwrap().as_str();
                 exports
                     .entry(target_override.to_string())
@@ -974,8 +1241,12 @@ fn parse_exports_and_submodules(
     } else {
         source
     };
-
-    (source.to_string(), exports, submodules)
+    Ok(ParseExportsAndSubmodulesOutput {
+        final_string: source.to_string(),
+        exports,
+        submodules,
+        patches,
+    })
 }
 
 fn parse_visibility(visibility: Option<Match>) -> Option<Visibility> {
@@ -998,6 +1269,7 @@ impl Preprocessor {
         language: ShaderLanguage,
         crate_name: Option<String>,
         module_name: Option<String>,
+        module_path: String,
         additional_patchsets: &[String],
     ) -> PreprocessResolver<'a> {
         let declared_usages = IndexMap::new();
@@ -1021,6 +1293,7 @@ impl Preprocessor {
             language,
             crate_name,
             module_name,
+            module_path,
             regexes: self.regexes.clone(),
             scope,
             final_string,
@@ -1033,14 +1306,17 @@ impl Preprocessor {
             exports: Default::default(),
             submodules: Default::default(),
             forced_patchsets: additional_patchsets.iter().cloned().collect(),
+            unprocessed_patches: Default::default(),
+            processed_patches: Default::default(),
+            original_string: shader_str.to_string(),
         };
     }
 
     // extract module name and all possible imports
     pub fn get_preprocessor_metadata(
         &self,
-        crate_name: Option<&str>,
-        module_name: Option<&str>,
+        crate_name: &Option<String>,
+        module_name: &Option<String>,
         ambiguous_module_exports: &HashMap<String, IndexMap<String, Vec<(Export, Visibility)>>>,
         ambiguous_module_mapping: &HashMap<String, IndexMap<String, Visibility>>,
         visibility_unsupported_modules: &HashSet<String>,
@@ -1051,15 +1327,29 @@ impl Preprocessor {
         let mut declared_uses = IndexMap::default();
         let mut used_usages = IndexMap::default();
 
+        let mut name = crate_name.clone();
         let mut declared_extensions = IndexSet::default();
         let mut declared_patchsets = IndexSet::default();
-        let mut name = module_name.map(|x| x.to_string());
         let mut offset = 0;
         let mut defines = HashMap::default();
         let mut effective_defs = HashSet::default();
 
         let mut lines = shader_str.lines();
         let mut lines = lines.replace_comments().peekable();
+
+        // We need the module set first so we can process in scope modules
+        let shader_str_without_comments = shader_str
+            .lines()
+            .replace_comments()
+            .collect::<Vec<Cow<str>>>()
+            .join("\n")
+            .to_string();
+        let ParseExportsAndSubmodulesOutput {
+            exports,
+            submodules,
+            ..
+        } = parse_exports_and_submodules(&self.regexes, language, &shader_str_without_comments)
+            .map_err(|err| err.inner)?;
 
         while let Some(mut line) = lines.next() {
             let (is_scope, def) =
@@ -1101,21 +1391,21 @@ impl Preprocessor {
                     &ambiguous_module_exports,
                     &ambiguous_module_mapping,
                     &visibility_unsupported_modules,
-                    crate_name,
-                    name.as_deref(),
+                    &crate_name,
+                    &name,
                     &mut declared_uses,
                     &mut declared_extensions,
                     &mut declared_patchsets,
                     true,
                 ) {
                     Ok(()) => {}
-                    Err(UsageFault::Error(err)) => {
+                    Err(UsageFault::UsageParseError(err)) => {
                         return Err(ComposerErrorInner::UsageParseError(
                             err.to_owned(),
                             initial_offset,
                         ));
                     }
-                    Err(UsageFault::ErrorWithOffset(err, offset)) => {
+                    Err(UsageFault::UsageParseErrorWithOffset(err, offset)) => {
                         return Err(ComposerErrorInner::UsageParseError(
                             err.to_owned(),
                             initial_offset + offset,
@@ -1127,6 +1417,7 @@ impl Preprocessor {
                             initial_offset + offset,
                         ));
                     }
+                    Err(UsageFault::ComposerError(err)) => return Err(err),
                 };
             } else if let Some(cap) = self.regexes.define_import_path_regex.captures(&line) {
                 name = name.or_else(|| Some(cap.name("import_path").unwrap().as_str().to_string()));
@@ -1167,25 +1458,16 @@ impl Preprocessor {
                     &line,
                     offset,
                     crate_name,
-                    name.as_deref(),
+                    &name,
                     &mut declared_uses,
                     &mut used_usages,
+                    &submodules,
                 )
                 .unwrap();
             }
 
             offset += line.len() + 1;
         }
-
-        let mut lines = shader_str.lines();
-        let shader_str = lines
-            .replace_comments()
-            .collect::<Vec<Cow<str>>>()
-            .join("\n")
-            .to_string();
-
-        let (_, exports, submodules) =
-            parse_exports_and_submodules(&self.regexes, language, &shader_str);
 
         Ok(PreprocessorMetaData {
             module_name: name,
@@ -1287,6 +1569,7 @@ fn vertex(
                 ShaderLanguage::Wgsl,
                 None,
                 None,
+                "/tests/abc.wgsl".to_string(),
                 &[],
             )
             .next(
@@ -1294,7 +1577,8 @@ fn vertex(
                 &mut Default::default(),
                 &Default::default(),
             )
-            .unwrap_err();
+            .unwrap_err()
+            .inner;
 
         let expected: ComposerErrorInner = ComposerErrorInner::UnknownShaderDefOperator {
             pos: 124,
@@ -1303,6 +1587,7 @@ fn vertex(
 
         assert_eq!(format!("{result_missing:?}"), format!("{expected:?}"),);
     }
+
     #[test]
     fn process_shader_def_equal_int() {
         #[rustfmt::skip]
@@ -1396,6 +1681,7 @@ fn vertex(
                 ShaderLanguage::Wgsl,
                 None,
                 None,
+                "/tests/abc.wgsl".to_string(),
                 &[],
             )
             .next(
@@ -1428,6 +1714,7 @@ fn vertex(
                 ShaderLanguage::Wgsl,
                 None,
                 None,
+                "/tests/abc.wgsl".to_string(),
                 &[],
             )
             .next(
@@ -1460,6 +1747,7 @@ fn vertex(
                 ShaderLanguage::Wgsl,
                 None,
                 None,
+                "/tests/abc.wgsl".to_string(),
                 &[],
             )
             .next(
@@ -1467,7 +1755,8 @@ fn vertex(
                 &mut Default::default(),
                 &Default::default(),
             )
-            .unwrap_err();
+            .unwrap_err()
+            .inner;
 
         let expected_err = ComposerErrorInner::UnknownShaderDef {
             pos: 124,
@@ -1482,6 +1771,7 @@ fn vertex(
                 ShaderLanguage::Wgsl,
                 None,
                 None,
+                "/tests/abc.wgsl".to_string(),
                 &[],
             )
             .next(
@@ -1489,7 +1779,8 @@ fn vertex(
                 &mut Default::default(),
                 &Default::default(),
             )
-            .unwrap_err();
+            .unwrap_err()
+            .inner;
 
         let expected_err = ComposerErrorInner::InvalidShaderDefComparisonValue {
             pos: 124,
@@ -1597,6 +1888,7 @@ fn vertex(
                 ShaderLanguage::Wgsl,
                 None,
                 None,
+                "/tests/abc.wgsl".to_string(),
                 &[],
             )
             .next(
@@ -1628,6 +1920,7 @@ fn vertex(
                 ShaderLanguage::Wgsl,
                 None,
                 None,
+                "/tests/abc.wgsl".to_string(),
                 &[],
             )
             .next(
@@ -1746,6 +2039,7 @@ fn vertex(
                 ShaderLanguage::Wgsl,
                 None,
                 None,
+                "/tests/abc.wgsl".to_owned(),
                 &[],
             )
             .next(
@@ -1777,6 +2071,7 @@ fn vertex(
                 ShaderLanguage::Wgsl,
                 None,
                 None,
+                "/tests/abc.wgsl".to_string(),
                 &[],
             )
             .next(
@@ -1802,19 +2097,26 @@ fn vertex(
         };
 
         let result_missing = processor
-            .preprocess(WGSL, &[].into(), ShaderLanguage::Wgsl, None, None, &[])
+            .preprocess(
+                WGSL,
+                &[].into(),
+                ShaderLanguage::Wgsl,
+                None,
+                None,
+                "/tests/abc.wgsl".to_string(),
+                &[],
+            )
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
                 &Default::default(),
-            );
-        let expected_err: Result<
-            (Option<String>, String, Vec<UseDefWithOffset>),
-            ComposerErrorInner,
-        > = Err(ComposerErrorInner::UnknownShaderDef {
+            )
+            .unwrap_err()
+            .inner;
+        let expected_err = ComposerErrorInner::UnknownShaderDef {
             pos: 124,
             shader_def_name: "TEXTURE".to_string(),
-        });
+        };
         assert_eq!(format!("{result_missing:?}"), format!("{expected_err:?}"),);
 
         let result_wrong_type = processor
@@ -1824,23 +2126,23 @@ fn vertex(
                 ShaderLanguage::Wgsl,
                 None,
                 None,
+                "/tests/abc.wgsl".to_string(),
                 &[],
             )
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
                 &Default::default(),
-            );
+            )
+            .unwrap_err()
+            .inner;
 
-        let expected_err: Result<
-            (Option<String>, String, Vec<UseDefWithOffset>),
-            ComposerErrorInner,
-        > = Err(ComposerErrorInner::InvalidShaderDefComparisonValue {
+        let expected_err = ComposerErrorInner::InvalidShaderDefComparisonValue {
             pos: 124,
             shader_def_name: "TEXTURE".to_string(),
             expected: "int".to_string(),
             value: "false".to_string(),
-        });
+        };
         assert_eq!(
             format!("{result_wrong_type:?}"),
             format!("{expected_err:?}"),
@@ -1917,6 +2219,7 @@ fn vertex(
                 ShaderLanguage::Wgsl,
                 None,
                 None,
+                "/tests/abc.wgsl".to_string(),
                 &[],
             )
             .next(
@@ -1965,8 +2268,8 @@ defined
             ..
         } = processor
             .get_preprocessor_metadata(
-                None,
-                None,
+                &None,
+                &None,
                 &Default::default(),
                 &Default::default(),
                 &Default::default(),
@@ -1977,7 +2280,15 @@ defined
             .unwrap();
         println!("defines: {:?}", shader_defs);
         match processor
-            .preprocess(&WGSL, &shader_defs, ShaderLanguage::Wgsl, None, None, &[])
+            .preprocess(
+                &WGSL,
+                &shader_defs,
+                ShaderLanguage::Wgsl,
+                None,
+                None,
+                "/tests/abc.wgsl".to_string(),
+                &[],
+            )
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
@@ -2040,8 +2351,8 @@ bool: false
             ..
         } = processor
             .get_preprocessor_metadata(
-                None,
-                None,
+                &None,
+                &None,
                 &Default::default(),
                 &Default::default(),
                 &Default::default(),
@@ -2052,7 +2363,15 @@ bool: false
             .unwrap();
         println!("defines: {:?}", shader_defs);
         match processor
-            .preprocess(&WGSL, &shader_defs, ShaderLanguage::Wgsl, None, None, &[])
+            .preprocess(
+                &WGSL,
+                &shader_defs,
+                ShaderLanguage::Wgsl,
+                None,
+                None,
+                "/tests/abc.wgsl".to_owned(),
+                &[],
+            )
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
@@ -2111,6 +2430,7 @@ fn vertex(
                 ShaderLanguage::Wgsl,
                 None,
                 None,
+                "/tests/abc.wgsl".to_string(),
                 &[],
             )
             .next(
@@ -2205,6 +2525,7 @@ fn vertex(
                 ShaderLanguage::Wgsl,
                 None,
                 None,
+                "/tests/abc.wgsl".to_string(),
                 &[],
             )
             .next(
@@ -2269,6 +2590,7 @@ fn vertex(
                 ShaderLanguage::Wgsl,
                 None,
                 None,
+                "/tests/abc.wgsl".to_string(),
                 &[],
             )
             .next(
@@ -2330,6 +2652,7 @@ fn vertex(
                 ShaderLanguage::Wgsl,
                 None,
                 None,
+                "/tests/abc.wgsl".to_string(),
                 &[],
             )
             .next(
@@ -2391,6 +2714,7 @@ fn vertex(
                 ShaderLanguage::Wgsl,
                 None,
                 None,
+                "/tests/abc.wgsl".to_string(),
                 &[],
             )
             .next(
@@ -2456,6 +2780,7 @@ fn vertex(
                 ShaderLanguage::Wgsl,
                 None,
                 None,
+                "/tests/abc.wgsl".to_string(),
                 &[],
             )
             .next(
@@ -2523,6 +2848,7 @@ fn vertex(
                 ShaderLanguage::Wgsl,
                 None,
                 None,
+                "/tests/abc.wgsl".to_string(),
                 &[],
             )
             .next(
@@ -2566,7 +2892,15 @@ fail 3
         const EXPECTED: &str = r"ok";
         let processor = Preprocessor::default();
         match processor
-            .preprocess(&INPUT, &[].into(), ShaderLanguage::Wgsl, None, None, &[])
+            .preprocess(
+                &INPUT,
+                &[].into(),
+                ShaderLanguage::Wgsl,
+                None,
+                None,
+                "/tests/abc.wgsl".to_string(),
+                &[],
+            )
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
@@ -2614,6 +2948,7 @@ fail 3
                 ShaderLanguage::Wgsl,
                 None,
                 None,
+                "/tests/abc.wgsl".to_string(),
                 &[],
             )
             .next(
