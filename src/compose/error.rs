@@ -37,8 +37,7 @@ impl ErrSource {
         match self {
             ErrSource::Module { name, defs, .. } => {
                 let module_set = &composer.module_sets.get(name).unwrap();
-                let output = module_set.get_preprocess_output(&defs).unwrap();
-                Cow::Owned(output.preprocessed_source.to_owned())
+                Cow::Owned(module_set.sanitized_source.to_owned())
             }
             ErrSource::Constructing { source, .. } => Cow::Borrowed(source),
         }

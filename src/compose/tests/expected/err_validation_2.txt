@@ -1,8 +1,9 @@
 error: failed to build a valid final module: Function [0] 'valid_inc::func' is invalid
   ┌─ tests/error_test/wgsl_valid_err.wgsl:7:5
   │  
-7 │ ╭     fn func() -> f32 {                      
-8 │ │     return 1u;              
+7 │   pub fn func() -> f32 {
+  │ ╭─────^
+8 │ │     return 1u;
   │ │            ^^ naga::Expression [0]
   │ ╰──────────────^ naga::Function [0]
   │  

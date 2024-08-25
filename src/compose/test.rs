@@ -164,8 +164,7 @@ mod test {
                 .err()
                 .unwrap();
             let text = error.emit_to_string(&composer);
-
-            // println!("{}", text);
+            // println!("TEXT\n{}", text);
             // let mut f = std::fs::File::create("err_validation_1.txt").unwrap();
             // f.write_all(text.as_bytes()).unwrap();
             // drop(f);
@@ -193,10 +192,10 @@ mod test {
 
             let text = error.emit_to_string(&composer);
 
-            // println!("{}", text);
-            // let mut f = std::fs::File::create("err_validation_2.txt").unwrap();
-            // f.write_all(text.as_bytes()).unwrap();
-            // drop(f);
+            println!("{}", text);
+            let mut f = std::fs::File::create("err_validation_2.txt").unwrap();
+            f.write_all(text.as_bytes()).unwrap();
+            drop(f);
 
             output_eq!(text, "tests/expected/err_validation_2.txt");
         }
@@ -215,7 +214,9 @@ mod test {
                 .err()
                 .unwrap();
             let text = error.emit_to_string(&composer);
-
+            // let mut f = std::fs::File::create("err_validation_2.txt").unwrap();
+            // f.write_all(text.as_bytes()).unwrap();
+            // drop(f);
             output_eq!(text, "tests/expected/err_parse.txt");
         }
 
@@ -571,9 +572,9 @@ mod test {
         {
             let err = module.err().unwrap();
             let err = err.emit_to_string(&composer);
-            let mut f = std::fs::File::create("invalid_override_base.txt").unwrap();
-            f.write_all(err.as_bytes()).unwrap();
-            drop(f);
+            // let mut f = std::fs::File::create("invalid_override_base.txt").unwrap();
+            // f.write_all(err.as_bytes()).unwrap();
+            // drop(f);
             output_eq!(err, "tests/expected/invalid_override_base.txt");
         }
     }

@@ -1958,7 +1958,7 @@ impl Composer {
                 inner: e.inner,
                 source: ErrSource::Constructing {
                     path: definition.file_path.to_owned(),
-                    source: source.clone(),
+                    source: sanitized_source.clone(),
                     offset: e.source.offset(),
                 },
             })?;
@@ -2032,7 +2032,7 @@ impl Composer {
                             inner: e.into(),
                             source: ErrSource::Constructing {
                                 path: file_path.to_owned(),
-                                source: source.clone(),
+                                source: sanitized_source.clone(),
                                 offset: composable.start_offset,
                             },
                         })?;
@@ -2045,7 +2045,7 @@ impl Composer {
                 inner: e.into(),
                 source: ErrSource::Constructing {
                     path: file_path.to_owned(),
-                    source: source.clone(),
+                    source: sanitized_source.clone(),
                     offset: composable.start_offset,
                 },
             })?;
@@ -2064,7 +2064,7 @@ impl Composer {
                             match module_index {
                                 0 => ErrSource::Constructing {
                                     path: file_path.to_owned(),
-                                    source: source.clone(),
+                                    source: sanitized_source.clone(),
                                     offset: composable.start_offset,
                                 },
                                 _ => {
@@ -2087,7 +2087,7 @@ impl Composer {
                         }
                         None => ErrSource::Constructing {
                             path: file_path.to_owned(),
-                            source: source.clone(),
+                            source: sanitized_source.clone(),
                             offset: composable.start_offset,
                         },
                     };

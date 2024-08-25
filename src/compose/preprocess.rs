@@ -62,7 +62,7 @@ impl Default for Preprocessor {
             def_regex: Regex::new(r"#\s*([\w|\d|_]+)").unwrap(),
             def_regex_delimited: Regex::new(r"#\s*\{([\w|\d|_]+)\}").unwrap(),
             use_regex: Regex::new(
-                r"^(\s*#\s*import\s)|(\s*(pub\s+)?use\s(patchset\s)?)|(\s*extend\s)",
+                r"^(\s*#\s*import\s)|((\s*(pub\s+)?use\s(patchset\s)?))|(\s*extend\s)",
             )
             .unwrap(),
             define_import_path_regex: Regex::new(r"^\s*#\s*define_import_path\s+(?P<import_path>[^\s]+)").unwrap(),
@@ -394,7 +394,7 @@ impl<'a> PreprocessResolver<'a> {
                 // ignore
             } else if self.scope.active() {
                 if self.regexes.use_regex.is_match(&line) {
-                    let _ = self.collect_usage_lines();
+                    let _ = self.collect_usage_lines(false);
                     output = true;
                     // ignore
                 } else {
@@ -457,15 +457,19 @@ impl<'a> PreprocessResolver<'a> {
         Ok(())
     }
 
-    fn collect_usage_lines(&mut self) -> String {
+    fn collect_usage_lines(&mut self, replace_with_whitespace: bool) -> String {
         let mut usage_lines = String::default();
         let mut open_count = 0;
 
         loop {
             // output spaces for removed lines to keep spans consistent (errors report against substituted_source, which is not preprocessed)
             let (current_line, current_original_line) = &self.lines[self.current_line];
-            self.final_string
-                .extend(std::iter::repeat(" ").take(current_original_line.len()));
+            if replace_with_whitespace {
+                self.final_string
+                    .extend(std::iter::repeat(" ").take(current_original_line.len()));
+            } else {
+                self.final_string.extend(current_original_line.chars());
+            }
             self.offset += current_original_line.len() + 1;
 
             // PERF: Ideally we don't do multiple `match_indices` passes over `line`
@@ -478,15 +482,12 @@ impl<'a> PreprocessResolver<'a> {
             // but we need the comments removed, and the iterator approach doesn't make that easy
             usage_lines.push_str(&current_line);
             usage_lines.push('\n');
-
             self.final_string.push('\n');
             if open_count == 0 || self.lines.get(self.current_line + 1).is_none() {
                 break;
             }
             self.current_line += 1;
         }
-
-        self.offset += 1;
 
         usage_lines
     }
@@ -577,7 +578,8 @@ impl<'a> PreprocessResolver<'a> {
                     {
                         if self.regexes.use_regex.is_match(&line) {
                             let initial_offset = self.offset;
-                            let usage_lines = self.collect_usage_lines();
+                            let usage_lines = self.collect_usage_lines(true);
+                            self.current_line += 1;
                             self.state = PreprocessState::ParsingUseStatement {
                                 usage_lines: usage_lines.clone(),
                                 initial_offset: initial_offset.clone(),
@@ -587,6 +589,7 @@ impl<'a> PreprocessResolver<'a> {
                             self.final_string.push_str(&original_line);
                             self.final_string.push('\n');
                             self.current_line += 1;
+                            self.offset += original_line.len() + 1;
                         }
                     }
                     self.state = PreprocessState::ProcessForcedPatchsets;
