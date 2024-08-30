@@ -287,6 +287,7 @@ pub fn canonicalize_usage(
 ) -> Result<(), CanonicalizationFault> {
     // TODO: Introduce backtracking to allow for recursive exports
     if let Some(mapping) = module_mappings.get(use_module_name) {
+        // TODO: Evaluate Visibility
         for (concrete_module, concrete_module_visibility) in mapping {
             if visibility_unsupported_modules.contains(concrete_module) {
                 result.push((concrete_module.to_string(), use_item.to_string(), None));
@@ -333,8 +334,6 @@ pub fn canonicalize_usage(
                             Export::Use(_, _, _) => {}
                         }
                     }
-                } else {
-                    // TODO: RETURN Visibilty error here
                 }
             } else {
                 return Err(CanonicalizationFault::MissingModules(vec![(

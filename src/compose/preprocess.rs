@@ -856,7 +856,6 @@ impl PreprocessResolver {
                     }
                 }
                 PreprocessState::ProcessForcedPatchsets => {
-                    self.state = PreprocessState::StartProcessingIdentifierSubstitution;
                     let unprocessed_patchsets: Vec<(String, usize)> = self
                         .forced_patchsets
                         .iter()

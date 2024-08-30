@@ -669,7 +669,6 @@ mod test {
                                 .unwrap(),
                             path.to_string()
                         );
-                        println!("FULL PATH {}", full_path);
                         crate_resolver
                             .add_submodule(crate::compose::CrateSubmoduleDescriptor {
                                 parent: submodule.parent,
@@ -699,6 +698,90 @@ mod test {
             .unwrap();
 
         assert_eq!(test_shader(&mut composer), 3.0);
+    }
+
+    #[cfg(feature = "test_shader")]
+    #[test]
+    fn invalid_module_usages() {
+        use core::panic;
+        use std::{fs, path::Path};
+
+        use crate::compose::{
+            CrateResolutionMiss, CrateResolutionStep, CrateRootDescriptor, ResolvedCrate,
+        };
+
+        let mut composer = Composer::default();
+
+        let mut crate_resolver = composer
+            .start_crate(CrateRootDescriptor {
+                root_source: include_str!("tests/modules/happy_fun_crate/lib_visibility_err.wgsl"),
+                root_file_path: "tests/modules/happy_fun_crate/lib.wgsl".to_owned(),
+                crate_name: "happy_fun_crate".to_owned(),
+                language: ShaderLanguage::Wgsl,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let resolved_crate: ResolvedCrate;
+        loop {
+            let result = crate_resolver.next();
+            match result {
+                Ok(CrateResolutionStep::Done(done)) => {
+                    resolved_crate = done;
+                    break;
+                }
+                Ok(CrateResolutionStep::Miss(CrateResolutionMiss::MissingSubmodules(
+                    submodules,
+                ))) => {
+                    for submodule in submodules {
+                        let path = format!(
+                            "{}/{}",
+                            submodule.parent.replace("::", "/"),
+                            submodule.submodule_name
+                        );
+                        let full_path = format!(
+                            "{}/src/compose/tests/modules{}/{}.wgsl",
+                            env!("CARGO_MANIFEST_DIR"),
+                            Path::parent(Path::new(module_path!()))
+                                .unwrap()
+                                .to_str()
+                                .unwrap(),
+                            path.to_string()
+                        );
+                        crate_resolver
+                            .add_submodule(crate::compose::CrateSubmoduleDescriptor {
+                                parent: submodule.parent,
+                                submodule_name: submodule.submodule_name,
+                                source: fs::read_to_string(full_path)
+                                    .map(|x| x.to_string())
+                                    .unwrap(),
+                                file_path: path.to_string(),
+                                language: ShaderLanguage::Wgsl,
+                            })
+                            .unwrap();
+                    }
+                }
+                Err(err) => panic!("ERR: {:?}", err),
+            }
+        }
+        composer.add_resolved_crate(resolved_crate).unwrap();
+
+        composer
+            .add_composable_module(ComposableModuleDescriptor {
+                source: include_str!("tests/modules/happy_fun_crate/top.wgsl"),
+                file_path: "tests/modules/happy_fun_crate/top.wgsl",
+                as_name: Some("test_module".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        composer
+            .make_naga_module(NagaModuleDescriptor {
+                file_path: &"tests/compute_test.wgsl",
+                source: include_str!("tests/compute_test.wgsl"),
+                ..Default::default()
+            })
+            .expect_err("EXPECTED THIS TO FAIL");
     }
 
     #[test]

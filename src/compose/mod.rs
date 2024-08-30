@@ -1374,19 +1374,7 @@ impl Composer {
         module_mappings: &mut HashMap<String, IndexMap<String, Option<Visibility>>>,
     ) -> Result<(), ComposerError> {
         let usages = usages.into_iter().cloned().collect::<Vec<UseDefinition>>();
-        // println!(
-        //     "USAGES {:?}",
-        //     preprocess_outputs
-        //         .iter()
-        //         .map(|(k, x)| (
-        //             k.clone().unwrap_or_default(),
-        //             x.usages
-        //                 .iter()
-        //                 .map(|y| y.definition.clone())
-        //                 .collect::<Vec<UseDefinition>>()
-        //         ))
-        //         .collect::<Vec<(String, Vec<UseDefinition>)>>()
-        // );
+
         for UseDefinition { module, .. } in usages.into_iter() {
             // we've already ensured usages exist when they were added
 
