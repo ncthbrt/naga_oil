@@ -656,19 +656,16 @@ impl PreprocessResolver {
                     let unprocessed_submodules = self
                         .submodules
                         .iter()
+                        .map(|x| format!("{module_name}::{x}").to_string())
                         .filter(|x| {
                             !module_mappings.contains_key(x.as_str())
                                 || !module_exports.contains_key(x.as_str())
                         })
-                        .cloned()
                         .collect::<IndexSet<String>>();
 
                     if !unprocessed_submodules.is_empty() {
                         return Ok(PreprocessStep::Miss(PreprocessMiss::MissingModules(
-                            unprocessed_submodules
-                                .iter()
-                                .map(|x| (format!("{module_name}::{x}").to_string(), 0))
-                                .collect(),
+                            unprocessed_submodules.into_iter().map(|x| (x, 0)).collect(),
                         )));
                     }
                     continue 'processor;

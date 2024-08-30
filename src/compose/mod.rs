@@ -1701,7 +1701,7 @@ impl Composer {
                 module_visibility: if &crate_name == module_path {
                     Some(Some(Visibility::Public))
                 } else {
-                    None
+                    Some(None)
                 },
                 module_index,
                 // These will all be initialized later
