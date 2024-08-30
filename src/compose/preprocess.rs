@@ -1,19 +1,19 @@
 use std::{
-    borrow::{Borrow, Cow},
+    borrow::Cow,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
 
 use indexmap::{IndexMap, IndexSet};
-use regex::{bytes::Captures, Match, Regex};
+use regex::{Match, Regex};
 
 use crate::compose::OverrideMode;
 
 use super::{
     comment_strip_iter::CommentReplaceExt,
     parse_usages::{
-        self, canonicalize_usage, gather_direct_usages, parse_uses,
-        substitute_with_canonical_identifiers, UsageFault,
+        self, canonicalize_usage, flatten_wildcard_use, parse_uses,
+        substitute_with_canonical_identifiers, CanonicalizationFault, UsageFault,
     },
     Composer, ComposerError, ComposerErrorInner, ErrSource, Export, ShaderDefValue, ShaderLanguage,
     UseBehaviour, UseDefWithOffset, UseDefinition, Visibility,
@@ -68,37 +68,23 @@ impl Default for Preprocessor {
             define_import_path_regex: Regex::new(r"^\s*#\s*define_import_path\s+(?P<import_path>[^\s]+)").unwrap(),
             define_shader_def_regex: Regex::new(r"^\s*#\s*define\s+([\w|\d|_]+)\s*([-\w|\d]+)?")
                 .unwrap(),
-            pub_fn_regex: Regex::new(r"(?P<lead>\s*)(?P<pub_keyword>pub\s+)((?P<virtual_keyword>virtual\s+)|(?P<patch_keyword>patch\s+))?(?P<fn_keyword>fn\s+)(?<target_function>[^\s]+)(?P<trail>\s*)\(",).unwrap(),
-            pub_var_regex: Regex::new(r"(?P<lead>\s*)(?P<pub_keyword>pub\s+)(?P<var_keyword>var\s*)(?P<var_arguments><.+?>\s*)?(?P<target_var>[^\:\s]+)").unwrap(),
-            pub_struct_regex: Regex::new(r"(?P<lead>\s*)(?P<pub_keyword>pub\s+)(?P<struct_keyword>struct\s+)(?P<target_struct>[^\s]+)").unwrap(),
-            pub_alias_regex: Regex::new(r"(?P<lead>\s*)(?P<pub_keyword>pub\s+)(?P<alias_keyword>alias\s+)(?P<target_alias>[^\s]+)(\s*)\=").unwrap(),
-            pub_constant_regex: Regex::new(r"(?P<lead>\s*)(?P<pub_keyword>pub\s+)(?P<constant_keyword>const\s+)(?P<target_const>[^\s\:]+)").unwrap(),
+            pub_fn_regex: Regex::new(r"(?P<lead>(^|\n)\s*)(?P<pub_keyword>pub\s+)((?P<virtual_keyword>virtual\s+)|(?P<patch_keyword>patch\s+))?(?P<fn_keyword>fn\s+)(?<target_function>[^\s]+)(?P<trail>\s*)\(",).unwrap(),
+            pub_var_regex: Regex::new(r"(?P<lead>(^|\n)\s*)(?P<pub_keyword>pub\s+)(?P<var_keyword>var\s*)(?P<var_arguments><.+?>\s*)?(?P<target_var>[^\:\s]+)").unwrap(),
+            pub_struct_regex: Regex::new(r"(?P<lead>(^|\n)\s*)(?P<pub_keyword>pub\s+)(?P<struct_keyword>struct\s+)(?P<target_struct>[^\s]+)").unwrap(),
+            pub_alias_regex: Regex::new(r"(?P<lead>(^|\n)\s*)(?P<pub_keyword>pub\s+)(?P<alias_keyword>alias\s+)(?P<target_alias>[^\s]+)(\s*)\=").unwrap(),
+            pub_constant_regex: Regex::new(r"(?P<lead>(^|\n)\s*)(?P<pub_keyword>pub\s+)(?P<constant_keyword>const\s+)(?P<target_const>[^\s\:]+)").unwrap(),
             module_regex: Regex::new(
-                format!(
-                    r"^(?P<lead>\s*)(?P<pub_keyword>pub\s+)?(?P<mod_keyword>mod\s+fn\s+)(?P<module_name>[^\s]+)(?P<trail>\s*);",
-                )
+                r"(?P<lead>(^|\n)\s*)(?P<pub_keyword>pub\s+)?(?P<mod_keyword>mod\s+)(?P<module_name>[^\s]+)(?P<trail>\s*);".to_string()
                 .as_str(),
             )
             .unwrap(),
             pub_override_regex: Regex::new(
-                    r"(?P<lead>\s*)(?P<pub_keyword>pub\s+)(?P<override_keyword>override\s+)(?P<target_override>[^\s:]+)",
+                    r"(?P<lead>(^|\n)\s*)(?P<pub_keyword>pub\s+)(?P<override_keyword>override\s+)(?P<target_override>[^\s:]+)",
             )
             .unwrap(),
             })
         }
     }
-}
-
-#[derive(Debug)]
-pub struct PreprocessorMetaData {
-    pub module_name: Option<String>,
-    pub usages: Vec<UseDefWithOffset>,
-    pub exports: IndexMap<String, Vec<(Export, Visibility)>>,
-    pub patchsets: IndexSet<String>,
-    pub extensions: IndexSet<String>,
-    pub submodules: IndexSet<String>,
-    pub defines: HashMap<String, ShaderDefValue>,
-    pub effective_defs: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -177,7 +163,7 @@ impl Scope {
 
 fn check_scope<'a>(
     regexes: &PreprocessorRegexes,
-    shader_defs: &HashMap<String, ShaderDefValue>,
+    shader_defs: Option<&HashMap<String, ShaderDefValue>>,
     line: &'a str,
     scope: Option<&mut Scope>,
     offset: usize,
@@ -185,18 +171,27 @@ fn check_scope<'a>(
     if let Some(cap) = regexes.ifdef_regex.captures(line) {
         let is_else = cap.get(1).is_some();
         let def = cap.get(2).unwrap().as_str();
+        let Some(shader_defs) = shader_defs else {
+            return Ok((true, Some(def)));
+        };
         let cond = shader_defs.contains_key(def);
         scope.map_or(Ok(()), |scope| scope.branch(is_else, cond, offset))?;
         return Ok((true, Some(def)));
     } else if let Some(cap) = regexes.ifndef_regex.captures(line) {
         let is_else = cap.get(1).is_some();
         let def = cap.get(2).unwrap().as_str();
+        let Some(shader_defs) = shader_defs else {
+            return Ok((true, Some(def)));
+        };
         let cond = !shader_defs.contains_key(def);
         scope.map_or(Ok(()), |scope| scope.branch(is_else, cond, offset))?;
         return Ok((true, Some(def)));
     } else if let Some(cap) = regexes.ifop_regex.captures(line) {
         let is_else = cap.get(1).is_some();
         let def = cap.get(2).unwrap().as_str();
+        let Some(shader_defs) = shader_defs else {
+            return Ok((true, Some(def)));
+        };
         let op = cap.get(3).unwrap();
         let val = cap.get(4).unwrap();
 
@@ -253,13 +248,18 @@ fn check_scope<'a>(
                 act_on(*def_value, val, op.as_str(), offset)?
             }
         };
-
         scope.map_or(Ok(()), |scope| scope.branch(is_else, new_scope, offset))?;
         return Ok((true, Some(def)));
     } else if regexes.else_regex.is_match(line) {
+        let Some(_) = shader_defs else {
+            return Ok((true, None));
+        };
         scope.map_or(Ok(()), |scope| scope.branch(true, true, offset))?;
         return Ok((true, None));
     } else if regexes.endif_regex.is_match(line) {
+        let Some(_) = shader_defs else {
+            return Ok((true, None));
+        };
         scope.map_or(Ok(()), |scope| scope.pop(offset))?;
         return Ok((true, None));
     }
@@ -269,6 +269,7 @@ fn check_scope<'a>(
 
 #[derive(Debug, Clone)]
 pub struct PreprocessOutput {
+    pub module_name: Option<String>,
     pub preprocessed_source: String,
     pub exports: IndexMap<String, (Export, Visibility)>,
     pub submodules: IndexSet<String>,
@@ -276,17 +277,26 @@ pub struct PreprocessOutput {
     pub extensions: IndexSet<String>,
     pub usages: Vec<UseDefWithOffset>,
     pub patches: Vec<(String, String)>,
+    // shader def values bound to this module
+    pub shader_defs: HashMap<String, ShaderDefValue>,
+    // list of shader_defs that can affect this crate
+    pub effective_defs: HashSet<String>,
 }
 
 #[derive(Debug)]
 enum PreprocessState {
-    Initial,
+    ProcessDirectives,
     DiscoveringSubmodulesAndExports,
     StartProcessingUsages,
     ParsingUsages,
     ParsingUseStatement {
         initial_offset: usize,
         usage_lines: String,
+    },
+    StartProcessingWildcards,
+    ProcessingWildcards,
+    ProcessingWildcard {
+        module_name: String,
     },
     ProcessForcedPatchsets,
     CanonicalizingPatches,
@@ -296,13 +306,13 @@ enum PreprocessState {
         original_line: String,
         decommented_line: String,
     },
-    Done(PreprocessOutput),
+    Done(Box<PreprocessOutput>),
 }
 
-pub struct PreprocessResolver<'a> {
+pub struct PreprocessResolver {
     lines: Vec<(String, String)>,
     current_line: usize,
-    shader_defs: &'a HashMap<String, ShaderDefValue>,
+    shader_defs: Option<HashMap<String, ShaderDefValue>>,
     scope: Scope,
     language: ShaderLanguage,
     crate_name: Option<String>,
@@ -316,12 +326,17 @@ pub struct PreprocessResolver<'a> {
     processed_patches: Vec<(String, String)>,
     unprocessed_patches: Vec<(String, usize)>,
     extensions: IndexSet<String>,
+    unprocessed_wildcards: IndexSet<(String, Option<Visibility>)>,
     forced_patchsets: IndexSet<String>,
     usages: IndexMap<String, UseDefWithOffset>,
     declared_usages: IndexMap<String, Vec<(String, Option<Visibility>, UseBehaviour)>>,
     exports: IndexMap<String, (Export, Visibility)>,
     submodules: IndexSet<String>,
     state: PreprocessState,
+    // the input shader def values plus the shader defs defined in this module
+    derived_shader_defs: HashMap<String, ShaderDefValue>,
+    // list of shader_defs that can affect this crate
+    effective_defs: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -331,7 +346,7 @@ pub enum PreprocessMiss {
 
 #[derive(Debug)]
 pub enum PreprocessStep {
-    Done(PreprocessOutput),
+    Done(Box<PreprocessOutput>),
     Miss(PreprocessMiss),
 }
 
@@ -339,9 +354,17 @@ fn map_err(inner: ComposerErrorInner, source: ErrSource) -> ComposerError {
     ComposerError { inner, source }
 }
 
-impl<'a> PreprocessResolver<'a> {
-    pub fn name(&self) -> &str {
+impl PreprocessResolver {
+    pub fn module_name(&self) -> &str {
         self.module_name.as_deref().unwrap_or_default()
+    }
+
+    pub fn crate_name(&self) -> &Option<String> {
+        &self.crate_name
+    }
+
+    pub fn module_path(&self) -> &str {
+        &self.module_path.as_ref()
     }
 
     pub fn original_source(&self) -> &str {
@@ -356,10 +379,10 @@ impl<'a> PreprocessResolver<'a> {
                 if v != "440" && v != "450" {
                     return Err(map_err(
                         ComposerErrorInner::GlslInvalidVersion(self.offset),
-                        ErrSource::Module {
-                            name: self.module_name.clone().unwrap_or_default(),
-                            offset: self.offset.clone(),
-                            defs: self.shader_defs.clone(),
+                        ErrSource::Constructing {
+                            offset: self.offset,
+                            path: self.module_path.clone(),
+                            source: self.original_source().to_string(),
                         },
                     ));
                 }
@@ -368,9 +391,30 @@ impl<'a> PreprocessResolver<'a> {
                     .module_name
                     .clone()
                     .or_else(|| Some(cap.name("import_path").unwrap().as_str().to_string()));
-            } else if check_scope(
+            } else if let Some(captures) = self.regexes.define_shader_def_regex.captures(&line) {
+                let def = captures.get(1).unwrap();
+                let name = def.as_str().to_string();
+                let value = if let Some(val) = captures.get(2) {
+                    if let Ok(val) = val.as_str().parse::<u32>() {
+                        ShaderDefValue::UInt(val)
+                    } else if let Ok(val) = val.as_str().parse::<i32>() {
+                        ShaderDefValue::Int(val)
+                    } else if let Ok(val) = val.as_str().parse::<bool>() {
+                        ShaderDefValue::Bool(val)
+                    } else {
+                        ShaderDefValue::Bool(false) // this error will get picked up when we fully preprocess the module
+                    }
+                } else {
+                    ShaderDefValue::Bool(true)
+                };
+                self.derived_shader_defs.insert(name, value);
+            } else if let (true, maybe_def) = check_scope(
                 &self.regexes,
-                self.shader_defs,
+                if self.shader_defs.is_some() {
+                    Some(&self.derived_shader_defs)
+                } else {
+                    None
+                },
                 &line,
                 Some(&mut self.scope),
                 self.offset,
@@ -384,14 +428,10 @@ impl<'a> PreprocessResolver<'a> {
                         offset: self.offset,
                     },
                 )
-            })?
-            .0 || self
-                .regexes
-                .define_shader_def_regex
-                .captures(&line)
-                .is_some()
-            {
-                // ignore
+            })? {
+                if let Some(def) = maybe_def {
+                    self.effective_defs.insert(def.to_owned());
+                }
             } else if self.scope.active() {
                 if self.regexes.use_regex.is_match(&line) {
                     let _ = self.collect_usage_lines(false);
@@ -401,7 +441,9 @@ impl<'a> PreprocessResolver<'a> {
                     let mut replaced_line = original_line.to_string();
                     for capture in self.regexes.def_regex.captures_iter(&original_line) {
                         let def = capture.get(1).unwrap();
-                        if let Some(def) = self.shader_defs.get(def.as_str()) {
+                        self.effective_defs
+                            .insert(capture.get(1).unwrap().as_str().to_owned());
+                        if let Some(def) = self.derived_shader_defs.get(def.as_str()) {
                             replaced_line = self
                                 .regexes
                                 .def_regex
@@ -415,7 +457,7 @@ impl<'a> PreprocessResolver<'a> {
                         .captures_iter(&original_line)
                     {
                         let def = capture.get(1).unwrap();
-                        if let Some(def) = self.shader_defs.get(def.as_str()) {
+                        if let Some(def) = self.derived_shader_defs.get(def.as_str()) {
                             replaced_line = self
                                 .regexes
                                 .def_regex_delimited
@@ -445,15 +487,14 @@ impl<'a> PreprocessResolver<'a> {
         self.scope.finish(self.offset).map_err(|inner| {
             map_err(
                 inner,
-                ErrSource::Module {
-                    name: self.module_name.clone().unwrap_or_default(),
-                    offset: self.offset.clone(),
-                    defs: self.shader_defs.clone(),
+                ErrSource::Constructing {
+                    offset: self.offset,
+                    path: self.module_path.clone(),
+                    source: self.original_source().to_string(),
                 },
             )
         })?;
         self.state = PreprocessState::DiscoveringSubmodulesAndExports;
-        debug_assert_eq!(self.original_string.len(), self.offset);
         Ok(())
     }
 
@@ -468,7 +509,7 @@ impl<'a> PreprocessResolver<'a> {
                 self.final_string
                     .extend(std::iter::repeat(" ").take(current_original_line.len()));
             } else {
-                self.final_string.extend(current_original_line.chars());
+                self.final_string.push_str(current_original_line);
             }
             self.offset += current_original_line.len() + 1;
 
@@ -480,7 +521,7 @@ impl<'a> PreprocessResolver<'a> {
             // PERF: it's bad that we allocate here. ideally we would use something like
             //     let import_lines = &shader_str[initial_offset..offset]
             // but we need the comments removed, and the iterator approach doesn't make that easy
-            usage_lines.push_str(&current_line);
+            usage_lines.push_str(current_line);
             usage_lines.push('\n');
             self.final_string.push('\n');
             if open_count == 0 || self.lines.get(self.current_line + 1).is_none() {
@@ -492,15 +533,88 @@ impl<'a> PreprocessResolver<'a> {
         usage_lines
     }
 
+    fn insert_reexports(
+        &mut self,
+        declared_usages: &IndexMap<String, Vec<(String, Option<Visibility>, UseBehaviour)>>,
+        module_exports: &mut HashMap<String, IndexMap<String, Vec<(Export, Visibility)>>>,
+        module_mappings: &mut HashMap<String, IndexMap<String, Option<Visibility>>>,
+    ) {
+        for (symbol_name, usages) in declared_usages.iter() {
+            if let Some((full_path, Some(visibility), use_behaviour)) = usages.first() {
+                let (module, symbol) = full_path
+                    .rsplit_once("::")
+                    .map(|(module, canonical)| (module.to_string(), Some(canonical.to_string())))
+                    .unwrap_or_else(|| (full_path.to_string(), None));
+                if self.module_name.as_deref().unwrap_or_default() != &module {
+                    self.exports.insert(
+                        symbol_name.to_string(),
+                        (
+                            Export::Use(module.clone(), symbol.clone(), use_behaviour.clone()),
+                            *visibility,
+                        ),
+                    );
+                    self.usages
+                        .entry(full_path.clone())
+                        .or_insert_with(|| UseDefWithOffset {
+                            definition: UseDefinition {
+                                module: module.clone(),
+                                items: vec![],
+                            },
+                            offset: 0,
+                        });
+                } else {
+                    self.usages
+                        .entry(module.clone())
+                        .or_insert_with(|| UseDefWithOffset {
+                            definition: UseDefinition {
+                                module: module.clone(),
+                                items: vec![],
+                            },
+                            offset: 0,
+                        })
+                        .definition
+                        .items
+                        .push(symbol.as_ref().unwrap_or(&symbol_name).clone());
+                }
+
+                module_exports
+                    .entry(self.module_name.clone().unwrap_or_default())
+                    .or_default()
+                    .entry(symbol_name.to_string())
+                    .or_default()
+                    .push((
+                        Export::Use(module, symbol.clone(), use_behaviour.clone()),
+                        *visibility,
+                    ));
+                if let Some((canonical_module, aliased_visibility)) = module_mappings
+                    .get(full_path)
+                    .map(|mappings: &IndexMap<String, Option<Visibility>>| {
+                        let (module, viz) = mappings.first().unwrap();
+                        (module.clone(), *viz)
+                    })
+                {
+                    // TODO Evaluate visibility
+                    // TODO: Evaluate using relative modules and inscope imports
+                    module_mappings
+                        .entry(full_path.to_string())
+                        .or_default()
+                        .insert(canonical_module.to_string(), Some(*visibility));
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
     pub fn next(
         &mut self,
         module_exports: &mut HashMap<String, IndexMap<String, Vec<(Export, Visibility)>>>,
-        module_mappings: &mut HashMap<String, IndexMap<String, Visibility>>,
+        module_mappings: &mut HashMap<String, IndexMap<String, Option<Visibility>>>,
+        module_wildcards: &mut HashMap<String, IndexSet<(String, Option<Visibility>)>>,
         visibility_unsupported_modules: &HashSet<String>,
     ) -> Result<PreprocessStep, ComposerError> {
         'processor: loop {
             match &self.state {
-                PreprocessState::Initial => {
+                PreprocessState::ProcessDirectives => {
                     self.process_directives()?;
                     continue 'processor;
                 }
@@ -517,21 +631,21 @@ impl<'a> PreprocessResolver<'a> {
                     )?;
                     self.unprocessed_patches = patches;
                     self.final_string = final_string;
-                    self.submodules.extend(submodules.into_iter());
+                    self.submodules.extend(submodules);
                     let module_name = self.module_name.clone().unwrap_or_default();
 
                     let module_export_entry =
                         module_exports.entry(module_name.clone()).or_default();
 
                     for (symbol, symbol_export) in exports {
-                        if symbol_export.len() > 1 {
+                        if let (Some(_), true) = (&self.shader_defs, symbol_export.len() > 1) {
                             // TODO: Add better error handling (specifically include symbol offsets)
                             return Err(map_err(
                                 ComposerErrorInner::AmbiguousExportError(symbol),
-                                ErrSource::Module {
-                                    name: self.module_name.clone().unwrap_or_default(),
-                                    offset: self.offset.clone(),
-                                    defs: self.shader_defs.clone(),
+                                ErrSource::Constructing {
+                                    offset: self.offset,
+                                    path: self.module_path.clone(),
+                                    source: self.original_source().to_string(),
                                 },
                             ));
                         } else {
@@ -541,7 +655,7 @@ impl<'a> PreprocessResolver<'a> {
                                 module_mappings
                                     .entry(submodule_name.clone())
                                     .or_default()
-                                    .insert(submodule_name, visibility.clone());
+                                    .insert(submodule_name, Some(*visibility));
                             };
                             self.exports.insert(symbol.clone(), export);
                             module_export_entry.insert(symbol, symbol_export);
@@ -549,9 +663,19 @@ impl<'a> PreprocessResolver<'a> {
                     }
 
                     self.state = PreprocessState::StartProcessingUsages;
-                    if !self.submodules.is_empty() {
+                    let unprocessed_submodules = self
+                        .submodules
+                        .iter()
+                        .filter(|x| {
+                            !module_mappings.contains_key(x.as_str())
+                                || !module_exports.contains_key(x.as_str())
+                        })
+                        .cloned()
+                        .collect::<IndexSet<String>>();
+
+                    if !unprocessed_submodules.is_empty() {
                         return Ok(PreprocessStep::Miss(PreprocessMiss::MissingModules(
-                            self.submodules
+                            unprocessed_submodules
                                 .iter()
                                 .map(|x| (format!("{module_name}::{x}").to_string(), 0))
                                 .collect(),
@@ -568,6 +692,7 @@ impl<'a> PreprocessResolver<'a> {
                         .map(|(replaced, original)| (replaced.to_string(), original.to_string()))
                         .collect();
                     self.current_line = 0;
+                    self.offset = 0;
                     self.final_string.clear();
                     self.state = PreprocessState::ParsingUsages;
                     continue 'processor;
@@ -582,7 +707,7 @@ impl<'a> PreprocessResolver<'a> {
                             self.current_line += 1;
                             self.state = PreprocessState::ParsingUseStatement {
                                 usage_lines: usage_lines.clone(),
-                                initial_offset: initial_offset.clone(),
+                                initial_offset,
                             };
                             continue 'processor;
                         } else {
@@ -592,90 +717,50 @@ impl<'a> PreprocessResolver<'a> {
                             self.offset += original_line.len() + 1;
                         }
                     }
-                    self.state = PreprocessState::ProcessForcedPatchsets;
+                    self.state = PreprocessState::StartProcessingWildcards;
+                    continue 'processor;
                 }
                 PreprocessState::ParsingUseStatement {
                     initial_offset,
                     usage_lines: import_lines,
                 } => {
                     let mut declared_usages = IndexMap::default();
+                    let mut declared_wildcard_usages = IndexSet::default();
+
                     let uses_result = parse_uses(
                         import_lines.as_str(),
-                        module_exports,
-                        module_mappings,
-                        visibility_unsupported_modules,
                         &self.crate_name,
                         &self.module_name,
+                        &self.submodules,
                         &mut declared_usages,
+                        &mut declared_wildcard_usages,
                         &mut self.extensions,
                         &mut self.patchsets,
-                        false,
                     );
                     match uses_result {
                         Ok(()) => {
-                            for (symbol_name, usages) in declared_usages.iter() {
-                                if let Some((full_path, visibility, use_behaviour)) = usages.first()
-                                {
-                                    if let Some(visibility) = visibility {
-                                        let (module, canonical) = full_path
-                                            .rsplit_once("::")
-                                            .map(|(module, canonical)| {
-                                                (module.to_string(), Some(canonical.to_string()))
-                                            })
-                                            .unwrap_or_else(|| (full_path.to_string(), None));
-                                        self.exports.insert(
-                                            symbol_name.to_string(),
-                                            (
-                                                Export::Use(
-                                                    module,
-                                                    canonical,
-                                                    use_behaviour.clone(),
-                                                ),
-                                                visibility.clone(),
-                                            ),
-                                        );
-                                        if let Some((canonical_module, aliased_visibility)) =
-                                            module_mappings.get(full_path).map(|mappings| {
-                                                let (module, viz) =
-                                                    mappings.first().unwrap().clone();
-                                                return (module.clone(), viz.clone());
-                                            })
-                                        {
-                                            // TODO Evaluate visibility
-                                            // TODO: Evaluate using relative modules and inscope imports
-                                            module_mappings
-                                                .entry(full_path.to_string())
-                                                .or_default()
-                                                .insert(
-                                                    canonical_module.to_string(),
-                                                    visibility.clone(),
-                                                );
-                                        }
-                                    }
-                                }
-                            }
+                            self.insert_reexports(
+                                &declared_usages,
+                                module_exports,
+                                module_mappings,
+                            );
+                            module_wildcards
+                                .entry(self.module_name.clone().unwrap_or_default())
+                                .or_default()
+                                .extend(declared_wildcard_usages.iter().cloned());
+                            self.unprocessed_wildcards.extend(declared_wildcard_usages);
                             self.declared_usages.extend(declared_usages);
-                        }
-                        Err(UsageFault::MissingModules(modules)) => {
-                            return Ok(PreprocessStep::Miss(PreprocessMiss::MissingModules(
-                                modules
-                                    .into_iter()
-                                    .map(|(item, relative_offset)| {
-                                        (item, relative_offset + initial_offset)
-                                    })
-                                    .collect(),
-                            )));
                         }
                         Err(UsageFault::UsageParseError(err)) => {
                             return Err(map_err(
                                 ComposerErrorInner::UsageParseError(
                                     err.to_owned(),
-                                    initial_offset.clone(),
+                                    *initial_offset,
                                 ),
-                                ErrSource::Module {
-                                    name: self.module_name.clone().unwrap_or_default(),
-                                    offset: self.offset.clone(),
-                                    defs: self.shader_defs.clone(),
+                                ErrSource::Constructing {
+                                    offset: self.offset,
+                                    path: self.module_path.clone(),
+                                    source: self.original_source().to_string(),
                                 },
                             ));
                         }
@@ -685,20 +770,20 @@ impl<'a> PreprocessResolver<'a> {
                                     err.to_owned(),
                                     initial_offset + additional_offset,
                                 ),
-                                ErrSource::Module {
-                                    name: self.module_name.clone().unwrap_or_default(),
-                                    offset: self.offset.clone(),
-                                    defs: self.shader_defs.clone(),
+                                ErrSource::Constructing {
+                                    offset: self.offset,
+                                    path: self.module_path.clone(),
+                                    source: self.original_source().to_string(),
                                 },
                             ));
                         }
                         Err(UsageFault::ComposerError(err)) => {
                             return Err(map_err(
                                 err,
-                                ErrSource::Module {
-                                    name: self.module_name.clone().unwrap_or_default(),
-                                    offset: self.offset.clone(),
-                                    defs: self.shader_defs.clone(),
+                                ErrSource::Constructing {
+                                    offset: self.offset,
+                                    path: self.module_path.clone(),
+                                    source: self.original_source().to_string(),
                                 },
                             ));
                         }
@@ -707,6 +792,81 @@ impl<'a> PreprocessResolver<'a> {
                     self.final_string.push('\n');
                     self.state = PreprocessState::ParsingUsages;
                     continue 'processor;
+                }
+                PreprocessState::StartProcessingWildcards => {
+                    self.state = PreprocessState::ProcessingWildcards;
+                    continue 'processor;
+                }
+                PreprocessState::ProcessingWildcards => {
+                    if let Some((module, _)) = self.unprocessed_wildcards.pop() {
+                        self.state = PreprocessState::ProcessingWildcard {
+                            module_name: module.clone(),
+                        };
+                    } else {
+                        self.state = PreprocessState::ProcessForcedPatchsets;
+                    }
+                    continue 'processor;
+                }
+                PreprocessState::ProcessingWildcard { module_name } => {
+                    let mut declared_usages = IndexMap::default();
+                    match flatten_wildcard_use(
+                        module_exports,
+                        module_mappings,
+                        module_wildcards,
+                        visibility_unsupported_modules,
+                        &self.crate_name,
+                        &self.submodules,
+                        &self.module_name,
+                        &module_name,
+                        &mut declared_usages,
+                        self.shader_defs.is_none(),
+                    ) {
+                        Ok(()) => {
+                            self.insert_reexports(
+                                &declared_usages,
+                                module_exports,
+                                module_mappings,
+                            );
+                            self.declared_usages.extend(declared_usages);
+                            self.state = PreprocessState::ProcessingWildcards;
+                            continue 'processor;
+                        }
+                        Err(CanonicalizationFault::MissingModules(modules)) => {
+                            return Ok(PreprocessStep::Miss(PreprocessMiss::MissingModules(
+                                modules,
+                            )));
+                        }
+                        Err(CanonicalizationFault::UsageParseError(err)) => {
+                            return Err(map_err(
+                                ComposerErrorInner::UsageParseError(err.to_owned(), 0),
+                                ErrSource::Constructing {
+                                    path: self.module_path.to_string(),
+                                    source: self.original_string.to_string(),
+                                    offset: 0,
+                                },
+                            ));
+                        }
+                        Err(CanonicalizationFault::UsageParseErrorWithOffset(err, offset)) => {
+                            return Err(map_err(
+                                ComposerErrorInner::UsageParseError(err.to_owned(), offset),
+                                ErrSource::Constructing {
+                                    path: self.module_path.to_string(),
+                                    source: self.original_string.to_string(),
+                                    offset: 0,
+                                },
+                            ));
+                        }
+                        Err(CanonicalizationFault::ComposerError(err)) => {
+                            return Err(map_err(
+                                err,
+                                ErrSource::Constructing {
+                                    path: self.module_path.to_string(),
+                                    source: self.original_string.to_string(),
+                                    offset: 0,
+                                },
+                            ));
+                        }
+                    }
                 }
                 PreprocessState::ProcessForcedPatchsets => {
                     self.state = PreprocessState::StartProcessingIdentifierSubstitution;
@@ -720,7 +880,6 @@ impl<'a> PreprocessResolver<'a> {
                         .cloned()
                         .map(|x| (x, 0))
                         .collect();
-
                     if !unprocessed_patchsets.is_empty() {
                         return Ok(PreprocessStep::Miss(PreprocessMiss::MissingModules(
                             unprocessed_patchsets,
@@ -745,22 +904,23 @@ impl<'a> PreprocessResolver<'a> {
                             &self.submodules,
                         );
 
-                        if full_paths.len() > 1 {
+                        if let (Some(_), true) = (&self.shader_defs, full_paths.len() > 1) {
                             return Err(map_err(
                                 ComposerErrorInner::UsageParseError(
                                     "Ambiguous paths".to_string(),
                                     *offset,
                                 ),
-                                ErrSource::Module {
-                                    name: self.name().to_string(),
-                                    offset: *offset,
-                                    defs: self.shader_defs.clone(),
+                                ErrSource::Constructing {
+                                    offset: self.offset,
+                                    path: self.module_path.clone(),
+                                    source: self.original_source().to_string(),
                                 },
                             ));
                         }
 
                         if let Some((module, func)) = patch.rsplit_once("::") {
                             let mut result = Default::default();
+                            let mut seen_modules = HashSet::new();
                             match canonicalize_usage(
                                 module_exports,
                                 module_mappings,
@@ -768,8 +928,9 @@ impl<'a> PreprocessResolver<'a> {
                                 &self.module_name,
                                 module,
                                 func,
-                                false,
+                                self.shader_defs.is_none(),
                                 &mut result,
+                                &mut seen_modules,
                             ) {
                                 Ok(_) => {
                                     let (canonical_module, canonical_item, export) =
@@ -835,7 +996,7 @@ impl<'a> PreprocessResolver<'a> {
                                         .push(canonical_item.to_string());
                                     Ok(())
                                 }
-                                Err(UsageFault::UsageParseError(err)) => Err(map_err(
+                                Err(CanonicalizationFault::UsageParseError(err)) => Err(map_err(
                                     ComposerErrorInner::UsageParseError(err, 0),
                                     ErrSource::Constructing {
                                         path: self.module_path.to_owned(),
@@ -843,27 +1004,28 @@ impl<'a> PreprocessResolver<'a> {
                                         offset: *offset,
                                     },
                                 )),
-                                Err(UsageFault::UsageParseErrorWithOffset(err, offset)) => {
-                                    Err(map_err(
-                                        ComposerErrorInner::UsageParseError(err, offset),
-                                        ErrSource::Constructing {
-                                            path: self.module_path.to_owned(),
-                                            source: self.original_string.to_owned(),
-                                            offset,
-                                        },
-                                    ))
-                                }
-                                Err(UsageFault::MissingModules(modules)) => {
+                                Err(CanonicalizationFault::UsageParseErrorWithOffset(
+                                    err,
+                                    offset,
+                                )) => Err(map_err(
+                                    ComposerErrorInner::UsageParseError(err, offset),
+                                    ErrSource::Constructing {
+                                        path: self.module_path.to_owned(),
+                                        source: self.original_string.to_owned(),
+                                        offset,
+                                    },
+                                )),
+                                Err(CanonicalizationFault::MissingModules(modules)) => {
                                     return Ok(PreprocessStep::Miss(
                                         PreprocessMiss::MissingModules(modules),
                                     ))
                                 }
-                                Err(UsageFault::ComposerError(err)) => Err(map_err(
+                                Err(CanonicalizationFault::ComposerError(err)) => Err(map_err(
                                     err,
-                                    ErrSource::Module {
-                                        name: self.module_name.clone().unwrap_or_default(),
-                                        offset: self.offset.clone(),
-                                        defs: self.shader_defs.clone(),
+                                    ErrSource::Constructing {
+                                        path: self.module_path.to_owned(),
+                                        source: self.original_string.to_owned(),
+                                        offset: self.offset,
                                     },
                                 )),
                             }?;
@@ -873,10 +1035,10 @@ impl<'a> PreprocessResolver<'a> {
                                     format!("patch {} needs to have a module in scope", patch),
                                     0,
                                 ),
-                                ErrSource::Module {
-                                    name: self.module_name.clone().unwrap_or_default(),
-                                    offset: self.offset.clone(),
-                                    defs: self.shader_defs.clone(),
+                                ErrSource::Constructing {
+                                    path: self.module_path.to_owned(),
+                                    source: self.original_string.to_owned(),
+                                    offset: self.offset,
                                 },
                             ));
                         }
@@ -891,13 +1053,13 @@ impl<'a> PreprocessResolver<'a> {
                         .zip(self.final_string.lines())
                         .map(|(replaced, original)| (replaced.to_string(), original.to_string()))
                         .collect();
+                    self.offset = 0;
                     self.current_line = 0;
                     self.final_string.clear();
                     self.state = PreprocessState::ProcessIdentifierSubstitution;
                 }
                 PreprocessState::ProcessIdentifierSubstitution => {
-                    while let Some((line, original_line)) =
-                        self.lines.get(self.current_line).cloned()
+                    if let Some((line, original_line)) = self.lines.get(self.current_line).cloned()
                     {
                         self.state = PreprocessState::SubstituteIdentifiers {
                             original_line,
@@ -905,7 +1067,9 @@ impl<'a> PreprocessResolver<'a> {
                         };
                         continue 'processor;
                     }
+
                     let output = PreprocessOutput {
+                        module_name: self.module_name.clone(),
                         preprocessed_source: self.final_string.clone(),
                         exports: self.exports.clone(),
                         submodules: self.submodules.clone(),
@@ -913,8 +1077,10 @@ impl<'a> PreprocessResolver<'a> {
                         extensions: self.extensions.clone(),
                         usages: self.usages.values().cloned().collect(),
                         patches: self.processed_patches.clone(),
+                        shader_defs: self.derived_shader_defs.clone(),
+                        effective_defs: self.effective_defs.clone(),
                     };
-                    self.state = PreprocessState::Done(output);
+                    self.state = PreprocessState::Done(Box::new(output));
 
                     continue 'processor;
                 }
@@ -929,12 +1095,12 @@ impl<'a> PreprocessResolver<'a> {
                         &self.crate_name,
                         &self.module_name,
                         &self.submodules,
-                        &module_exports,
-                        &module_mappings,
-                        &visibility_unsupported_modules,
+                        module_exports,
+                        module_mappings,
+                        visibility_unsupported_modules,
                         &self.declared_usages,
                         &mut Default::default(),
-                        true,
+                        self.shader_defs.is_none(),
                     )
                     .unwrap_or_else(|_| original_line.clone());
                     // we run against the de-commented line to replace real imports, and throw an error if appropriate
@@ -944,25 +1110,22 @@ impl<'a> PreprocessResolver<'a> {
                         &self.crate_name,
                         &self.module_name,
                         &self.submodules,
-                        &module_exports,
-                        &module_mappings,
-                        &visibility_unsupported_modules,
+                        module_exports,
+                        module_mappings,
+                        visibility_unsupported_modules,
                         &self.declared_usages,
                         &mut self.usages,
-                        false,
+                        self.shader_defs.is_none(),
                     ) {
                         Ok(_) => {}
-                        Err(UsageFault::MissingModules(modules)) => {
+                        Err(CanonicalizationFault::MissingModules(modules)) => {
                             return Ok(PreprocessStep::Miss(PreprocessMiss::MissingModules(
                                 modules,
                             )));
                         }
-                        Err(UsageFault::UsageParseError(err)) => {
+                        Err(CanonicalizationFault::UsageParseError(err)) => {
                             return Err(map_err(
-                                ComposerErrorInner::UsageParseError(
-                                    err.to_owned(),
-                                    self.offset.clone(),
-                                ),
+                                ComposerErrorInner::UsageParseError(err.to_owned(), self.offset),
                                 ErrSource::Constructing {
                                     path: self.module_path.to_owned(),
                                     source: self.original_string.to_owned(),
@@ -970,20 +1133,17 @@ impl<'a> PreprocessResolver<'a> {
                                 },
                             ));
                         }
-                        Err(UsageFault::UsageParseErrorWithOffset(err, additional_offset)) => {
+                        Err(CanonicalizationFault::UsageParseErrorWithOffset(err, offset)) => {
                             return Err(map_err(
-                                ComposerErrorInner::UsageParseError(
-                                    err.to_owned(),
-                                    self.offset + additional_offset,
-                                ),
+                                ComposerErrorInner::UsageParseError(err.to_owned(), offset),
                                 ErrSource::Constructing {
                                     path: self.module_path.to_owned(),
                                     source: self.original_string.to_owned(),
-                                    offset: self.offset,
+                                    offset,
                                 },
                             ));
                         }
-                        Err(UsageFault::ComposerError(err)) => {
+                        Err(CanonicalizationFault::ComposerError(err)) => {
                             return Err(map_err(
                                 err,
                                 ErrSource::Constructing {
@@ -1017,6 +1177,23 @@ struct ParseExportsAndSubmodulesOutput {
     exports: IndexMap<String, Vec<(Export, Visibility)>>,
     submodules: IndexSet<String>,
     patches: Vec<(String, usize)>,
+}
+
+fn get_submodules(
+    regexes: &PreprocessorRegexes,
+    language: ShaderLanguage,
+    source: &str,
+) -> IndexSet<String> {
+    if language == ShaderLanguage::Wgsl {
+        let mut submodules: IndexSet<String> = Default::default();
+        for cap in regexes.module_regex.captures_iter(source) {
+            let module_name = cap.name("module_name").unwrap().as_str();
+            submodules.insert(module_name.to_string());
+        }
+        submodules
+    } else {
+        return IndexSet::new();
+    }
 }
 
 // TODO: Make spans consistent
@@ -1265,16 +1442,17 @@ impl Preprocessor {
     // strip module name and imports
     // also strip "#version xxx"
     // replace items with resolved decorated names
-    pub fn preprocess<'a>(
+    #[allow(clippy::too_many_arguments)]
+    pub fn preprocess(
         &self,
         shader_str: &str,
-        shader_defs: &'a HashMap<String, ShaderDefValue>,
+        shader_defs: Option<HashMap<String, ShaderDefValue>>,
         language: ShaderLanguage,
         crate_name: Option<String>,
         module_name: Option<String>,
         module_path: String,
         additional_patchsets: &[String],
-    ) -> PreprocessResolver<'a> {
+    ) -> PreprocessResolver {
         let declared_usages = IndexMap::new();
         let extensions = IndexSet::new();
         let patchsets = additional_patchsets.iter().cloned().collect();
@@ -1292,7 +1470,7 @@ impl Preprocessor {
         return PreprocessResolver {
             lines,
             current_line: 0,
-            shader_defs,
+            shader_defs: shader_defs.clone(),
             language,
             crate_name,
             module_name,
@@ -1305,183 +1483,21 @@ impl Preprocessor {
             extensions,
             usages: Default::default(),
             declared_usages,
-            state: PreprocessState::Initial,
+            state: PreprocessState::ProcessDirectives,
             exports: Default::default(),
             submodules: Default::default(),
             forced_patchsets: additional_patchsets.iter().cloned().collect(),
             unprocessed_patches: Default::default(),
             processed_patches: Default::default(),
             original_string: shader_str.to_string(),
+            unprocessed_wildcards: Default::default(),
+            derived_shader_defs: shader_defs.unwrap_or_default(),
+            effective_defs: Default::default(),
         };
     }
 
-    // extract module name and all possible imports
-    pub fn get_preprocessor_metadata(
-        &self,
-        crate_name: &Option<String>,
-        module_name: &Option<String>,
-        ambiguous_module_exports: &HashMap<String, IndexMap<String, Vec<(Export, Visibility)>>>,
-        ambiguous_module_mapping: &HashMap<String, IndexMap<String, Visibility>>,
-        visibility_unsupported_modules: &HashSet<String>,
-        shader_str: &str,
-        allow_defines: bool,
-        language: ShaderLanguage,
-    ) -> Result<PreprocessorMetaData, ComposerErrorInner> {
-        let mut declared_uses = IndexMap::default();
-        let mut used_usages = IndexMap::default();
-
-        let mut name = crate_name.clone();
-        let mut declared_extensions = IndexSet::default();
-        let mut declared_patchsets = IndexSet::default();
-        let mut offset = 0;
-        let mut defines = HashMap::default();
-        let mut effective_defs = HashSet::default();
-
-        let mut lines = shader_str.lines();
-        let mut lines = lines.replace_comments().peekable();
-
-        // We need the module set first so we can process in scope modules
-        let shader_str_without_comments = shader_str
-            .lines()
-            .replace_comments()
-            .collect::<Vec<Cow<str>>>()
-            .join("\n")
-            .to_string();
-        let ParseExportsAndSubmodulesOutput {
-            exports,
-            submodules,
-            ..
-        } = parse_exports_and_submodules(&self.regexes, language, &shader_str_without_comments)
-            .map_err(|err| err.inner)?;
-
-        while let Some(mut line) = lines.next() {
-            let (is_scope, def) =
-                check_scope(&self.regexes, &HashMap::default(), &line, None, offset)?;
-
-            if is_scope {
-                if let Some(def) = def {
-                    effective_defs.insert(def.to_owned());
-                }
-            } else if self.regexes.use_regex.is_match(&line) {
-                let mut usage_lines = String::default();
-                let mut open_count = 0;
-                let initial_offset = offset;
-
-                loop {
-                    // PERF: Ideally we don't do multiple `match_indices` passes over `line`
-                    // in addition to the final pass for the import parse
-                    open_count += line.match_indices('{').count();
-                    open_count = open_count.saturating_sub(line.match_indices('}').count());
-
-                    // PERF: it's bad that we allocate here. ideally we would use something like
-                    //     let import_lines = &shader_str[initial_offset..offset]
-                    // but we need the comments removed, and the iterator approach doesn't make that easy
-                    usage_lines.push_str(&line);
-                    usage_lines.push('\n');
-
-                    if open_count == 0 || lines.peek().is_none() {
-                        break;
-                    }
-
-                    // output spaces for removed lines to keep spans consistent (errors report against substituted_source, which is not preprocessed)
-                    offset += line.len() + 1;
-
-                    line = lines.next().unwrap();
-                }
-
-                match parse_uses(
-                    usage_lines.as_str(),
-                    &ambiguous_module_exports,
-                    &ambiguous_module_mapping,
-                    &visibility_unsupported_modules,
-                    &crate_name,
-                    &name,
-                    &mut declared_uses,
-                    &mut declared_extensions,
-                    &mut declared_patchsets,
-                    true,
-                ) {
-                    Ok(()) => {}
-                    Err(UsageFault::UsageParseError(err)) => {
-                        return Err(ComposerErrorInner::UsageParseError(
-                            err.to_owned(),
-                            initial_offset,
-                        ));
-                    }
-                    Err(UsageFault::UsageParseErrorWithOffset(err, offset)) => {
-                        return Err(ComposerErrorInner::UsageParseError(
-                            err.to_owned(),
-                            initial_offset + offset,
-                        ));
-                    }
-                    Err(UsageFault::MissingModules(modules)) => {
-                        return Err(ComposerErrorInner::ModuleNotFound(
-                            modules.first().unwrap().0.to_string(),
-                            initial_offset + offset,
-                        ));
-                    }
-                    Err(UsageFault::ComposerError(err)) => return Err(err),
-                };
-            } else if let Some(cap) = self.regexes.define_import_path_regex.captures(&line) {
-                name = name.or_else(|| Some(cap.name("import_path").unwrap().as_str().to_string()));
-            } else if let Some(cap) = self.regexes.define_shader_def_regex.captures(&line) {
-                if allow_defines {
-                    let def = cap.get(1).unwrap();
-                    let name = def.as_str().to_string();
-
-                    let value = if let Some(val) = cap.get(2) {
-                        if let Ok(val) = val.as_str().parse::<u32>() {
-                            ShaderDefValue::UInt(val)
-                        } else if let Ok(val) = val.as_str().parse::<i32>() {
-                            ShaderDefValue::Int(val)
-                        } else if let Ok(val) = val.as_str().parse::<bool>() {
-                            ShaderDefValue::Bool(val)
-                        } else {
-                            ShaderDefValue::Bool(false) // this error will get picked up when we fully preprocess the module
-                        }
-                    } else {
-                        ShaderDefValue::Bool(true)
-                    };
-
-                    defines.insert(name, value);
-                } else {
-                    return Err(ComposerErrorInner::DefineInModule(offset));
-                }
-            } else {
-                for cap in self
-                    .regexes
-                    .def_regex
-                    .captures_iter(&line)
-                    .chain(self.regexes.def_regex_delimited.captures_iter(&line))
-                {
-                    effective_defs.insert(cap.get(1).unwrap().as_str().to_owned());
-                }
-
-                gather_direct_usages(
-                    &line,
-                    offset,
-                    crate_name,
-                    &name,
-                    &mut declared_uses,
-                    &mut used_usages,
-                    &submodules,
-                )
-                .unwrap();
-            }
-
-            offset += line.len() + 1;
-        }
-
-        Ok(PreprocessorMetaData {
-            module_name: name,
-            usages: used_usages.into_values().collect(),
-            exports,
-            effective_defs,
-            extensions: declared_extensions,
-            patchsets: declared_patchsets,
-            submodules,
-            defines,
-        })
+    pub fn get_submodules(&self, shader_str: &str, language: ShaderLanguage) -> IndexSet<String> {
+        get_submodules(&self.regexes, language, shader_str)
     }
 }
 
@@ -1568,7 +1584,7 @@ fn vertex(
         let result_missing = processor
             .preprocess(
                 WGSL,
-                &[("TEXTURE".to_owned(), ShaderDefValue::Bool(true))].into(),
+                Some([("TEXTURE".to_owned(), ShaderDefValue::Bool(true))].into()),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -1576,6 +1592,7 @@ fn vertex(
                 &[],
             )
             .next(
+                &mut Default::default(),
                 &mut Default::default(),
                 &mut Default::default(),
                 &Default::default(),
@@ -1680,7 +1697,7 @@ fn vertex(
         match processor
             .preprocess(
                 WGSL,
-                &[("TEXTURE".to_string(), ShaderDefValue::Int(3))].into(),
+                Some([("TEXTURE".to_string(), ShaderDefValue::Int(3))].into()),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -1690,7 +1707,8 @@ fn vertex(
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
-                &Default::default(),
+                &mut Default::default(),
+                &mut Default::default(),
             )
             .unwrap()
         {
@@ -1698,13 +1716,13 @@ fn vertex(
                 assert_eq!(
                     result
                         .preprocessed_source
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", ""),
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', ""),
                     EXPECTED_EQ
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", "")
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', "")
                 );
             }
             not_good => panic!("ERR: {:?}", not_good),
@@ -1713,7 +1731,7 @@ fn vertex(
         match processor
             .preprocess(
                 WGSL,
-                &[("TEXTURE".to_string(), ShaderDefValue::Int(7))].into(),
+                Some([("TEXTURE".to_string(), ShaderDefValue::Int(7))].into()),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -1721,6 +1739,7 @@ fn vertex(
                 &[],
             )
             .next(
+                &mut Default::default(),
                 &mut Default::default(),
                 &mut Default::default(),
                 &mut Default::default(),
@@ -1731,13 +1750,13 @@ fn vertex(
                 assert_eq!(
                     result
                         .preprocessed_source
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", ""),
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', ""),
                     EXPECTED_NEQ
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", "")
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', "")
                 );
             }
             not_good => panic!("ERR: {:?}", not_good),
@@ -1746,7 +1765,7 @@ fn vertex(
         let result_missing = processor
             .preprocess(
                 WGSL,
-                &Default::default(),
+                Some(Default::default()),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -1754,6 +1773,7 @@ fn vertex(
                 &[],
             )
             .next(
+                &mut Default::default(),
                 &mut Default::default(),
                 &mut Default::default(),
                 &Default::default(),
@@ -1770,7 +1790,7 @@ fn vertex(
         let result_wrong_type = processor
             .preprocess(
                 WGSL,
-                &[("TEXTURE".to_string(), ShaderDefValue::Bool(true))].into(),
+                Some([("TEXTURE".to_string(), ShaderDefValue::Bool(true))].into()),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -1778,6 +1798,7 @@ fn vertex(
                 &[],
             )
             .next(
+                &mut Default::default(),
                 &mut Default::default(),
                 &mut Default::default(),
                 &Default::default(),
@@ -1887,7 +1908,7 @@ fn vertex(
         match processor
             .preprocess(
                 WGSL,
-                &[("TEXTURE".to_string(), ShaderDefValue::Bool(true))].into(),
+                Some([("TEXTURE".to_string(), ShaderDefValue::Bool(true))].into()),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -1897,19 +1918,20 @@ fn vertex(
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
+                &mut Default::default(),
                 &Default::default(),
             ) {
             Ok(PreprocessStep::Done(result)) => {
                 assert_eq!(
                     result
                         .preprocessed_source
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", ""),
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', ""),
                     EXPECTED_EQ
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", ""),
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', ""),
                 );
             }
             Ok(not_good) => panic!("ERR: {:?}", not_good),
@@ -1919,7 +1941,7 @@ fn vertex(
         match processor
             .preprocess(
                 WGSL,
-                &[("TEXTURE".to_string(), ShaderDefValue::Bool(false))].into(),
+                Some([("TEXTURE".to_string(), ShaderDefValue::Bool(false))].into()),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -1929,19 +1951,20 @@ fn vertex(
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
+                &mut Default::default(),
                 &Default::default(),
             ) {
             Ok(PreprocessStep::Done(result)) => {
                 assert_eq!(
                     result
                         .preprocessed_source
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", ""),
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', ""),
                     EXPECTED_NEQ
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", "")
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', "")
                 );
             }
             Ok(not_good) => panic!("ERR: {:?}", not_good),
@@ -2038,7 +2061,7 @@ fn vertex(
         match processor
             .preprocess(
                 WGSL,
-                &[("TEXTURE".to_string(), ShaderDefValue::Bool(true))].into(),
+                Some([("TEXTURE".to_string(), ShaderDefValue::Bool(true))].into()),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -2048,19 +2071,20 @@ fn vertex(
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
+                &mut Default::default(),
                 &Default::default(),
             ) {
             Ok(PreprocessStep::Done(result)) => {
                 assert_eq!(
                     result
                         .preprocessed_source
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", ""),
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', ""),
                     EXPECTED_EQ
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", "")
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', "")
                 );
             }
             Ok(not_good) => panic!("ERR: {:?}", not_good),
@@ -2070,7 +2094,7 @@ fn vertex(
         match processor
             .preprocess(
                 WGSL,
-                &[("TEXTURE".to_string(), ShaderDefValue::Bool(false))].into(),
+                Some([("TEXTURE".to_string(), ShaderDefValue::Bool(false))].into()),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -2080,19 +2104,20 @@ fn vertex(
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
+                &mut Default::default(),
                 &Default::default(),
             ) {
             Ok(PreprocessStep::Done(result)) => {
                 assert_eq!(
                     result
                         .preprocessed_source
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", ""),
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', ""),
                     EXPECTED_NEQ
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", "")
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', "")
                 );
             }
             Ok(not_good) => panic!("ERR: {:?}", not_good),
@@ -2102,7 +2127,7 @@ fn vertex(
         let result_missing = processor
             .preprocess(
                 WGSL,
-                &[].into(),
+                Some([].into()),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -2110,6 +2135,7 @@ fn vertex(
                 &[],
             )
             .next(
+                &mut Default::default(),
                 &mut Default::default(),
                 &mut Default::default(),
                 &Default::default(),
@@ -2125,7 +2151,7 @@ fn vertex(
         let result_wrong_type = processor
             .preprocess(
                 WGSL,
-                &[("TEXTURE".to_string(), ShaderDefValue::Int(7))].into(),
+                Some([("TEXTURE".to_string(), ShaderDefValue::Int(7))].into()),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -2133,6 +2159,7 @@ fn vertex(
                 &[],
             )
             .next(
+                &mut Default::default(),
                 &mut Default::default(),
                 &mut Default::default(),
                 &Default::default(),
@@ -2213,12 +2240,14 @@ fn vertex(
         match processor
             .preprocess(
                 WGSL,
-                &[
-                    ("BOOL_VALUE".to_string(), ShaderDefValue::Bool(true)),
-                    ("FIRST_VALUE".to_string(), ShaderDefValue::Int(5)),
-                    ("SECOND_VALUE".to_string(), ShaderDefValue::Int(3)),
-                ]
-                .into(),
+                Some(
+                    [
+                        ("BOOL_VALUE".to_string(), ShaderDefValue::Bool(true)),
+                        ("FIRST_VALUE".to_string(), ShaderDefValue::Int(5)),
+                        ("SECOND_VALUE".to_string(), ShaderDefValue::Int(3)),
+                    ]
+                    .into(),
+                ),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -2228,19 +2257,20 @@ fn vertex(
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
+                &mut Default::default(),
                 &Default::default(),
             ) {
             Ok(PreprocessStep::Done(result)) => {
                 assert_eq!(
                     result
                         .preprocessed_source
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", ""),
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', ""),
                     EXPECTED_REPLACED
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", "")
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', "")
                 );
             }
             Ok(not_good) => panic!("ERR: {:?}", not_good),
@@ -2266,26 +2296,11 @@ defined
 
 ";
         let processor = Preprocessor::default();
-        let PreprocessorMetaData {
-            defines: shader_defs,
-            ..
-        } = processor
-            .get_preprocessor_metadata(
-                &None,
-                &None,
-                &Default::default(),
-                &Default::default(),
-                &Default::default(),
-                &WGSL,
-                true,
-                ShaderLanguage::Wgsl,
-            )
-            .unwrap();
-        println!("defines: {:?}", shader_defs);
+
         match processor
             .preprocess(
-                &WGSL,
-                &shader_defs,
+                WGSL,
+                Some([].into()),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -2295,19 +2310,20 @@ defined
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
+                &mut Default::default(),
                 &Default::default(),
             ) {
             Ok(PreprocessStep::Done(result)) => {
                 assert_eq!(
                     result
                         .preprocessed_source
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", ""),
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', ""),
                     EXPECTED
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", ""),
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', ""),
                 );
             }
             Ok(not_good) => panic!("ERR: {:?}", not_good),
@@ -2349,26 +2365,10 @@ bool: false
 
 ";
         let processor = Preprocessor::default();
-        let PreprocessorMetaData {
-            defines: shader_defs,
-            ..
-        } = processor
-            .get_preprocessor_metadata(
-                &None,
-                &None,
-                &Default::default(),
-                &Default::default(),
-                &Default::default(),
-                &WGSL,
-                true,
-                ShaderLanguage::Wgsl,
-            )
-            .unwrap();
-        println!("defines: {:?}", shader_defs);
         match processor
             .preprocess(
-                &WGSL,
-                &shader_defs,
+                WGSL,
+                Some([].into()),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -2378,19 +2378,20 @@ bool: false
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
+                &mut Default::default(),
                 &Default::default(),
             ) {
             Ok(PreprocessStep::Done(result)) => {
                 assert_eq!(
                     result
                         .preprocessed_source
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", ""),
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', ""),
                     EXPECTED
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", ""),
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', ""),
                 );
             }
             Ok(not_good) => panic!("ERR: {:?}", not_good),
@@ -2428,8 +2429,8 @@ fn vertex(
         let processor = Preprocessor::default();
         match processor
             .preprocess(
-                &WGSL_ELSE_IFDEF,
-                &[].into(),
+                WGSL_ELSE_IFDEF,
+                Some([].into()),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -2439,19 +2440,20 @@ fn vertex(
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
+                &mut Default::default(),
                 &Default::default(),
             ) {
             Ok(PreprocessStep::Done(result)) => {
                 assert_eq!(
                     result
                         .preprocessed_source
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", ""),
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', ""),
                     EXPECTED
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", "")
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', "")
                 );
             }
             Ok(not_good) => panic!("ERR: {:?}", not_good),
@@ -2523,8 +2525,8 @@ fn vertex(
         let processor = Preprocessor::default();
         match processor
             .preprocess(
-                &WGSL_ELSE_IFDEF_NO_ELSE_FALLBACK,
-                &[].into(),
+                WGSL_ELSE_IFDEF_NO_ELSE_FALLBACK,
+                Some([].into()),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -2534,19 +2536,20 @@ fn vertex(
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
+                &mut Default::default(),
                 &Default::default(),
             ) {
             Ok(PreprocessStep::Done(result)) => {
                 assert_eq!(
                     result
                         .preprocessed_source
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", ""),
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', ""),
                     EXPECTED
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", "")
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', "")
                 );
             }
             Ok(not_good) => panic!("ERR: {:?}", not_good),
@@ -2588,8 +2591,8 @@ fn vertex(
         let processor = Preprocessor::default();
         match processor
             .preprocess(
-                &WGSL_ELSE_IFDEF,
-                &[("TEXTURE".to_string(), ShaderDefValue::Bool(true))].into(),
+                WGSL_ELSE_IFDEF,
+                Some([("TEXTURE".to_string(), ShaderDefValue::Bool(true))].into()),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -2599,19 +2602,20 @@ fn vertex(
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
+                &mut Default::default(),
                 &Default::default(),
             ) {
             Ok(PreprocessStep::Done(result)) => {
                 assert_eq!(
                     result
                         .preprocessed_source
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", ""),
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', ""),
                     EXPECTED
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", "")
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', "")
                 );
             }
             Ok(not_good) => panic!("ERR: {:?}", not_good),
@@ -2648,10 +2652,11 @@ fn vertex(
 }
 ";
         let processor = Preprocessor::default();
+        let shader_defs = [("SECOND_TEXTURE".to_string(), ShaderDefValue::Bool(true))].into();
         match processor
             .preprocess(
-                &WGSL_ELSE_IFDEF,
-                &[("SECOND_TEXTURE".to_string(), ShaderDefValue::Bool(true))].into(),
+                WGSL_ELSE_IFDEF,
+                Some(shader_defs),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -2661,19 +2666,20 @@ fn vertex(
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
+                &mut Default::default(),
                 &Default::default(),
             ) {
             Ok(PreprocessStep::Done(result)) => {
                 assert_eq!(
                     result
                         .preprocessed_source
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", ""),
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', ""),
                     EXPECTED
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", "")
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', "")
                 );
             }
             Ok(not_good) => panic!("ERR: {:?}", not_good),
@@ -2712,8 +2718,8 @@ fn vertex(
         let processor = Preprocessor::default();
         match processor
             .preprocess(
-                &WGSL_ELSE_IFDEF,
-                &[("THIRD_TEXTURE".to_string(), ShaderDefValue::Bool(true))].into(),
+                WGSL_ELSE_IFDEF,
+                Some([("THIRD_TEXTURE".to_string(), ShaderDefValue::Bool(true))].into()),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -2723,19 +2729,20 @@ fn vertex(
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
+                &mut Default::default(),
                 &Default::default(),
             ) {
             Ok(PreprocessStep::Done(result)) => {
                 assert_eq!(
                     result
                         .preprocessed_source
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", ""),
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', ""),
                     EXPECTED
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", "")
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', "")
                 );
             }
             Ok(not_good) => panic!("ERR: {:?}", not_good),
@@ -2774,12 +2781,14 @@ fn vertex(
         let processor = Preprocessor::default();
         match processor
             .preprocess(
-                &WGSL_ELSE_IFDEF,
-                &[
-                    ("SECOND_TEXTURE".to_string(), ShaderDefValue::Bool(true)),
-                    ("THIRD_TEXTURE".to_string(), ShaderDefValue::Bool(true)),
-                ]
-                .into(),
+                WGSL_ELSE_IFDEF,
+                Some(
+                    [
+                        ("SECOND_TEXTURE".to_string(), ShaderDefValue::Bool(true)),
+                        ("THIRD_TEXTURE".to_string(), ShaderDefValue::Bool(true)),
+                    ]
+                    .into(),
+                ),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -2789,19 +2798,20 @@ fn vertex(
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
+                &mut Default::default(),
                 &Default::default(),
             ) {
             Ok(PreprocessStep::Done(result)) => {
                 assert_eq!(
                     result
                         .preprocessed_source
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", ""),
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', ""),
                     EXPECTED
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", "")
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', "")
                 );
             }
             Ok(not_good) => panic!("ERR: {:?}", not_good),
@@ -2846,8 +2856,8 @@ fn vertex(
         let processor = Preprocessor::default();
         match processor
             .preprocess(
-                &WGSL_COMPLICATED_ELSE_IFDEF,
-                &[("IS_DEFINED".to_string(), ShaderDefValue::Bool(true))].into(),
+                WGSL_COMPLICATED_ELSE_IFDEF,
+                Some([("IS_DEFINED".to_string(), ShaderDefValue::Bool(true))].into()),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -2857,19 +2867,20 @@ fn vertex(
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
+                &mut Default::default(),
                 &Default::default(),
             ) {
             Ok(PreprocessStep::Done(result)) => {
                 assert_eq!(
                     result
                         .preprocessed_source
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", ""),
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', ""),
                     EXPECTED
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", "")
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', "")
                 );
             }
             Ok(not_good) => panic!("ERR: {:?}", not_good),
@@ -2896,8 +2907,8 @@ fail 3
         let processor = Preprocessor::default();
         match processor
             .preprocess(
-                &INPUT,
-                &[].into(),
+                INPUT,
+                Some([].into()),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -2907,19 +2918,20 @@ fail 3
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
+                &mut Default::default(),
                 &Default::default(),
             ) {
             Ok(PreprocessStep::Done(result)) => {
                 assert_eq!(
                     result
                         .preprocessed_source
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", ""),
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', ""),
                     EXPECTED
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", "")
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', "")
                 );
             }
             Ok(not_good) => panic!("ERR: {:?}", not_good),
@@ -2946,8 +2958,8 @@ fail 3
         let processor = Preprocessor::default();
         match processor
             .preprocess(
-                &INPUT,
-                &[("x".to_owned(), ShaderDefValue::Int(2))].into(),
+                INPUT,
+                Some([("x".to_owned(), ShaderDefValue::Int(2))].into()),
                 ShaderLanguage::Wgsl,
                 None,
                 None,
@@ -2957,19 +2969,20 @@ fail 3
             .next(
                 &mut Default::default(),
                 &mut Default::default(),
+                &mut Default::default(),
                 &Default::default(),
             ) {
             Ok(PreprocessStep::Done(result)) => {
                 assert_eq!(
                     result
                         .preprocessed_source
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", ""),
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', ""),
                     EXPECTED
-                        .replace(" ", "")
-                        .replace("\n", "")
-                        .replace("\r", "")
+                        .replace(' ', "")
+                        .replace('\n', "")
+                        .replace('\r', "")
                 );
             }
             Ok(not_good) => panic!("ERR: {:?}", not_good),

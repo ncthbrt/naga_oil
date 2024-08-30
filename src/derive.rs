@@ -218,7 +218,7 @@ impl<'a> DerivedModule<'a> {
 
     // remap a global from source context into our derived context
     pub fn import_global(&mut self, h_global: &Handle<GlobalVariable>) -> Handle<GlobalVariable> {
-        self.rename_global(&h_global, None)
+        self.rename_global(h_global, None)
     }
 
     // remap either a const or pipeline override expression from source context into our derived context

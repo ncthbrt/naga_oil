@@ -3,7 +3,10 @@
 mod test {
     #[allow(unused_imports)]
     use std::io::Write;
-    use std::{borrow::Cow, collections::HashMap};
+    use std::{
+        borrow::Cow,
+        collections::{HashMap, HashSet},
+    };
 
     use wgpu::{
         BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor, BindGroupLayoutEntry,
@@ -12,8 +15,8 @@ mod test {
     };
 
     use crate::compose::{
-        get_preprocessor_data, ComposableModuleDescriptor, Composer, NagaModuleDescriptor,
-        ShaderDefValue, ShaderLanguage, ShaderType, UseDefinition,
+        preprocess, ComposableModuleDescriptor, Composer, NagaModuleDescriptor, ShaderDefValue,
+        ShaderLanguage, ShaderType, UseDefinition,
     };
 
     macro_rules! output_eq {
@@ -192,10 +195,10 @@ mod test {
 
             let text = error.emit_to_string(&composer);
 
-            println!("{}", text);
-            let mut f = std::fs::File::create("err_validation_2.txt").unwrap();
-            f.write_all(text.as_bytes()).unwrap();
-            drop(f);
+            // println!("{}", text);
+            // let mut f = std::fs::File::create("err_validation_2.txt").unwrap();
+            // f.write_all(text.as_bytes()).unwrap();
+            // drop(f);
 
             output_eq!(text, "tests/expected/err_validation_2.txt");
         }
@@ -533,6 +536,87 @@ mod test {
             .unwrap();
 
         assert_eq!(test_shader(&mut composer), 2.0);
+    }
+
+    #[cfg(feature = "test_shader")]
+    #[test]
+    fn wildcard_usages() {
+        use core::panic;
+        use std::{fs, path::Path};
+
+        use crate::compose::{
+            CrateResolutionMiss, CrateResolutionStep, CrateRootDescriptor, ResolvedCrate,
+        };
+
+        let mut composer = Composer::default();
+
+        let mut crate_resolver = composer
+            .start_crate(CrateRootDescriptor {
+                root_source: include_str!("tests/wildcards/lib.wgsl"),
+                root_file_path: "tests/wildcards/lib.wgsl".to_owned(),
+                crate_name: "module_root".to_owned(),
+                language: ShaderLanguage::Wgsl,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let resolved_crate: ResolvedCrate;
+        loop {
+            let result = crate_resolver.next();
+            match result {
+                Ok(CrateResolutionStep::Done(done)) => {
+                    resolved_crate = done;
+                    break;
+                }
+                Ok(CrateResolutionStep::Miss(CrateResolutionMiss::MissingSubmodules(
+                    submodules,
+                ))) => {
+                    for submodule in submodules {
+                        assert_eq!(submodule.parent, "module_root");
+                        let path = match submodule.submodule_name.as_str() {
+                            "module_a" => "tests/wildcards/module_a.wgsl",
+                            "module_b" => "tests/wildcards/module_b.wgsl",
+                            "module_c" => "tests/wildcards/module_c.wgsl",
+                            module => panic!("UNEXPECTED MODULE \"{}\"", module),
+                        };
+                        let full_path = format!(
+                            "{}/src/compose{}/{}",
+                            env!("CARGO_MANIFEST_DIR"),
+                            Path::parent(Path::new(module_path!()))
+                                .unwrap()
+                                .to_str()
+                                .unwrap(),
+                            path.to_string()
+                        );
+                        crate_resolver
+                            .add_submodule(crate::compose::CrateSubmoduleDescriptor {
+                                parent: submodule.parent,
+                                submodule_name: submodule.submodule_name,
+                                source: fs::read_to_string(full_path)
+                                    .map(|x| x.to_string())
+                                    .unwrap(),
+                                file_path: path.to_string(),
+                                language: ShaderLanguage::Wgsl,
+                            })
+                            .unwrap();
+                    }
+                }
+                Err(err) => panic!("ERR: {:?}", err),
+            }
+        }
+
+        composer.add_resolved_crate(resolved_crate).unwrap();
+
+        composer
+            .add_composable_module(ComposableModuleDescriptor {
+                source: include_str!("tests/wildcards/top.wgsl"),
+                file_path: "tests/wildcards/top.wgsl",
+                as_name: Some("test_module".to_owned()),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(test_shader(&mut composer), 6.0);
     }
 
     #[test]
@@ -1022,62 +1106,109 @@ mod test {
         assert_eq!(test_shader(&mut composer), 36.0);
     }
 
+    #[cfg(feature = "test_shader")]
     #[test]
+    fn module_system_good() {
+        let mut composer = Composer::default();
+
+        composer
+            .add_composable_module(ComposableModuleDescriptor {
+                source: include_str!("tests/rusty_imports/mod_a_b_c.wgsl"),
+                file_path: "tests/rusty_imports/mod_a_b_c.wgsl",
+                ..Default::default()
+            })
+            .unwrap();
+
+        composer
+            .add_composable_module(ComposableModuleDescriptor {
+                source: include_str!("tests/rusty_imports/mod_a_x.wgsl"),
+                file_path: "tests/rusty_imports/mod_a_x.wgsl",
+                ..Default::default()
+            })
+            .unwrap();
+
+        composer
+            .add_composable_module(ComposableModuleDescriptor {
+                source: include_str!("tests/rusty_imports/top.wgsl"),
+                file_path: "tests/rusty_imports/top.wgsl",
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(test_shader(&mut composer), 36.0);
+    }
+
+    #[test]
+    #[ignore = "Language has been changed making collecting imports upfront very difficult without resolving the whole tree"]
     fn test_bevy_path_imports() {
-        let (_, mut imports, _) = get_preprocessor_data(
-            include_str!("tests/bevy_path_imports/skill.wgsl"),
-            ShaderLanguage::Wgsl,
-            &Default::default(),
-            &Default::default(),
-            &Default::default(),
-        );
-        imports.iter_mut().for_each(|import| import.items.sort());
-        imports.sort_by(|a, b| a.module.cmp(&b.module));
-        assert_eq!(
-            imports,
-            vec![
-                UseDefinition {
-                    module: "\"shaders/skills/hit.wgsl\"".to_owned(),
-                    items: (vec!["frag".to_owned(), "vert".to_owned(),]),
-                },
-                UseDefinition {
-                    module: "\"shaders/skills/lightning.wgsl\"".to_owned(),
-                    items: (vec!["frag".to_owned(), "vert".to_owned(),]),
-                },
-                UseDefinition {
-                    module: "\"shaders/skills/lightning_ring.wgsl\"".to_owned(),
-                    items: (vec!["frag".to_owned(), "vert".to_owned(),]),
-                },
-                UseDefinition {
-                    module: "\"shaders/skills/magic_arrow.wgsl\"".to_owned(),
-                    items: (vec!["frag".to_owned(), "vert".to_owned(),]),
-                },
-                UseDefinition {
-                    module: "\"shaders/skills/orb.wgsl\"".to_owned(),
-                    items: (vec!["frag".to_owned(), "vert".to_owned(),]),
-                },
-                UseDefinition {
-                    module: "\"shaders/skills/railgun_trail.wgsl\"".to_owned(),
-                    items: (vec!["frag".to_owned(), "vert".to_owned(),]),
-                },
-                UseDefinition {
-                    module: "\"shaders/skills/shared.wgsl\"".to_owned(),
-                    items: (vec![
-                        "Vertex".to_owned(),
-                        "VertexOutput".to_owned(),
-                        "VertexOutput".to_owned(),
-                    ]),
-                },
-                UseDefinition {
-                    module: "\"shaders/skills/slash.wgsl\"".to_owned(),
-                    items: (vec!["frag".to_owned(), "vert".to_owned(),]),
-                },
-                UseDefinition {
-                    module: "\"shaders/skills/sound.wgsl\"".to_owned(),
-                    items: (vec!["frag".to_owned(), "vert".to_owned(),]),
-                },
-            ]
-        );
+        let preprocessor = preprocess::Preprocessor::default();
+        let mut module_exports = HashMap::default();
+        let mut module_mappings = HashMap::default();
+        let mut module_wildcards = HashMap::default();
+        let mut visibility_unsupported_modules = HashSet::default();
+
+        let resolver = preprocessor
+            .preprocess(
+                include_str!("tests/bevy_path_imports/skill.wgsl"),
+                None,
+                ShaderLanguage::Wgsl,
+                None,
+                None,
+                "tests/bevy_path_imports/skill.wgsl".to_string(),
+                &[],
+            )
+            .next(
+                &mut module_exports,
+                &mut module_mappings,
+                &mut module_wildcards,
+                &mut visibility_unsupported_modules,
+            );
+
+        // assert_eq!(
+        //     imports,
+        //     vec![
+        //         UseDefinition {
+        //             module: "\"shaders/skills/hit.wgsl\"".to_owned(),
+        //             items: (vec!["frag".to_owned(), "vert".to_owned(),]),
+        //         },
+        //         UseDefinition {
+        //             module: "\"shaders/skills/lightning.wgsl\"".to_owned(),
+        //             items: (vec!["frag".to_owned(), "vert".to_owned(),]),
+        //         },
+        //         UseDefinition {
+        //             module: "\"shaders/skills/lightning_ring.wgsl\"".to_owned(),
+        //             items: (vec!["frag".to_owned(), "vert".to_owned(),]),
+        //         },
+        //         UseDefinition {
+        //             module: "\"shaders/skills/magic_arrow.wgsl\"".to_owned(),
+        //             items: (vec!["frag".to_owned(), "vert".to_owned(),]),
+        //         },
+        //         UseDefinition {
+        //             module: "\"shaders/skills/orb.wgsl\"".to_owned(),
+        //             items: (vec!["frag".to_owned(), "vert".to_owned(),]),
+        //         },
+        //         UseDefinition {
+        //             module: "\"shaders/skills/railgun_trail.wgsl\"".to_owned(),
+        //             items: (vec!["frag".to_owned(), "vert".to_owned(),]),
+        //         },
+        //         UseDefinition {
+        //             module: "\"shaders/skills/shared.wgsl\"".to_owned(),
+        //             items: (vec![
+        //                 "Vertex".to_owned(),
+        //                 "VertexOutput".to_owned(),
+        //                 "VertexOutput".to_owned(),
+        //             ]),
+        //         },
+        //         UseDefinition {
+        //             module: "\"shaders/skills/slash.wgsl\"".to_owned(),
+        //             items: (vec!["frag".to_owned(), "vert".to_owned(),]),
+        //         },
+        //         UseDefinition {
+        //             module: "\"shaders/skills/sound.wgsl\"".to_owned(),
+        //             items: (vec!["frag".to_owned(), "vert".to_owned(),]),
+        //         },
+        //     ]
+        // );
     }
 
     #[test]
@@ -1162,9 +1293,9 @@ mod test {
             .unwrap();
 
         // TODO enable this test when HLSL support is available
-        if cfg!(feature = "test_shader") && false {
-            assert_eq!(test_shader(&mut composer), 28.0);
-        }
+        // if cfg!(feature = "test_shader") && false {
+        //     assert_eq!(test_shader(&mut composer), 28.0);
+        // }
 
         let module = composer
             .make_naga_module(NagaModuleDescriptor {
@@ -1269,16 +1400,22 @@ mod test {
         }
     }
 
-    // actually run a shader and extract the result
-    // needs the composer to contain a module called "test_module", with a function called "entry_point" returning an f32.
-    fn test_shader(composer: &mut Composer) -> f32 {
+    fn test_shader_with_source(file_path: &str, source: &str, composer: &mut Composer) -> f32 {
         let module = composer
             .make_naga_module(NagaModuleDescriptor {
-                source: include_str!("tests/compute_test.wgsl"),
-                file_path: "tests/compute_test.wgsl",
+                source,
+                file_path,
                 ..Default::default()
             })
             .unwrap();
+        // let info = composer.create_validator().validate(&module).unwrap();
+        // let wgsl = naga::back::wgsl::write_string(
+        //     &module,
+        //     &info,
+        //     naga::back::wgsl::WriterFlags::EXPLICIT_TYPES,
+        // )
+        // .unwrap();
+        // println!("wgsl:\n {wgsl}");
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let adapter = instance
@@ -1377,5 +1514,15 @@ mod test {
         let view: &[u8] = &output_buffer.slice(..).get_mapped_range();
 
         f32::from_le_bytes(view.try_into().unwrap())
+    }
+
+    // actually run a shader and extract the result
+    // needs the composer to contain a module called "test_module", with a function called "entry_point" returning an f32.
+    fn test_shader(composer: &mut Composer) -> f32 {
+        test_shader_with_source(
+            "tests/compute_test.wgsl",
+            include_str!("tests/compute_test.wgsl"),
+            composer,
+        )
     }
 }

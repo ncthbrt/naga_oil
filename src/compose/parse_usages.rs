@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fmt::format,
-};
+use std::collections::{HashMap, HashSet};
 
 use indexmap::{IndexMap, IndexSet};
 
@@ -11,17 +8,17 @@ use super::{
     Visibility,
 };
 
-pub fn parse_uses<'a>(
-    input: &'a str,
-    module_exports: &HashMap<String, IndexMap<String, Vec<(Export, Visibility)>>>,
-    module_mapping: &HashMap<String, IndexMap<String, Visibility>>,
-    visibility_unsupported_modules: &HashSet<String>,
+#[allow(clippy::type_complexity)]
+
+pub fn parse_uses(
+    input: &str,
     crate_name: &Option<String>,
     from_module: &Option<String>,
+    submodules: &IndexSet<String>,
     declared_usages: &mut IndexMap<String, Vec<(String, Option<Visibility>, UseBehaviour)>>,
+    declared_wildcard_usages: &mut IndexSet<(String, Option<Visibility>)>,
     declared_extensions: &mut IndexSet<String>,
     declared_patchsets: &mut IndexSet<String>,
-    allow_ambiguous: bool,
 ) -> Result<(), UsageFault> {
     let mut tokens = Tokenizer::new(input, false).peekable();
 
@@ -92,19 +89,35 @@ pub fn parse_uses<'a>(
     loop {
         match tokens.peek() {
             Some(Token::Identifier(ident, _)) => {
-                let mut ident = *ident;
+                let mut ident = ident.to_string();
                 if stack.is_empty() {
-                    if ident == "crate" && crate_name.is_some() {
-                        ident = crate_name.as_deref().unwrap();
-                    } else if ident == "self" && from_module.is_some() {
-                        ident = from_module.as_deref().unwrap();
-                    } else if ident == "super" && from_module.is_some() {
-                        // TODO RAISE AN ERROR IF NO SUPER
-                        let (spr, _) = from_module.as_deref().unwrap().rsplit_once("::").unwrap();
-                        ident = spr
+                    if let Some((start, residual)) = ident.split_once("::") {
+                        if start == "crate" && crate_name.is_some() {
+                            ident = format!(
+                                "{}::{residual}",
+                                crate_name.as_deref().unwrap().to_string()
+                            );
+                        } else if start == "self" && from_module.is_some() {
+                            ident = format!(
+                                "{}::{residual}",
+                                from_module.as_deref().unwrap().to_string()
+                            );
+                        } else if start == "super" && from_module.is_some() {
+                            let (spr, _) =
+                                from_module.as_deref().unwrap().rsplit_once("::").unwrap();
+                            ident = format!("{spr}::{residual}");
+                        } else if submodules.contains(start) && from_module.is_some() {
+                            ident = format!(
+                                "{}::{}::{}",
+                                from_module.as_deref().unwrap(),
+                                start,
+                                residual
+                            );
+                        }
                     }
                 }
-                current.push_str(&ident);
+                let ident = &ident;
+                current.push_str(ident);
                 tokens.next();
 
                 if tokens.peek().and_then(Token::identifier) == Some("as") {
@@ -130,19 +143,12 @@ pub fn parse_uses<'a>(
                     as_name = Some(name);
                 } else if tokens.peek().and_then(Token::other) == Some(&'*') {
                     if !current.is_empty() {
-                        let module_name = format!("{}{}", stack.join(""), current);
-                        flatten_wildcard_use(
-                            module_exports,
-                            module_mapping,
-                            visibility_unsupported_modules,
-                            from_module,
-                            &module_name,
-                            allow_ambiguous,
-                            declared_usages,
-                            visibility,
-                        )?;
+                        let joined = format!("{}{}", stack.join(""), current);
+                        let module_name = joined.strip_suffix("::").unwrap_or_else(|| &joined);
+                        declared_wildcard_usages.insert((module_name.to_owned(), visibility));
                         current = String::default();
                         as_name = None;
+                        tokens.next();
                     }
                 }
                 // support deprecated #import mod item
@@ -184,36 +190,22 @@ pub fn parse_uses<'a>(
 
                     if extension_import {
                         let full_path = format!("{}{}", stack.join(""), current);
-                        let offset = tokens.peek().map(|x| x.pos()).unwrap_or_default();
-                        if module_mapping.contains_key(&full_path) {
-                            declared_extensions.insert(full_path);
-                        } else {
-                            return Err(UsageFault::MissingModules(vec![(
-                                full_path.clone(),
-                                offset,
-                            )]));
-                        }
+                        declared_extensions.insert(full_path);
                     } else if patchset_import {
                         let full_path = format!("{}{}", stack.join(""), current);
-                        let offset = tokens.peek().map(|x| x.pos()).unwrap_or_default();
-                        if module_mapping.contains_key(&full_path) {
-                            declared_usages
-                                .entry(used_name.clone())
-                                .or_insert(Default::default())
-                                .push((full_path.clone(), visibility, use_behaviour.clone()));
-                            declared_patchsets.insert(full_path);
-                        } else {
-                            return Err(UsageFault::MissingModules(vec![(
-                                full_path.clone(),
-                                offset,
-                            )]));
-                        }
+                        declared_usages.entry(used_name.clone()).or_default().push((
+                            full_path.clone(),
+                            visibility,
+                            use_behaviour.clone(),
+                        ));
+                        declared_patchsets.insert(full_path);
                     } else {
                         let full_path = format!("{}{}", stack.join(""), current);
-                        declared_usages
-                            .entry(used_name.clone())
-                            .or_insert(Default::default())
-                            .push((full_path, visibility, use_behaviour.clone()));
+                        declared_usages.entry(used_name.clone()).or_default().push((
+                            full_path,
+                            visibility,
+                            use_behaviour.clone(),
+                        ));
                     }
 
                     current = String::default();
@@ -242,9 +234,9 @@ pub fn parse_uses<'a>(
                     ));
                 }
             }
-            Some(Token::Other(_, pos)) => {
+            Some(Token::Other(token, pos)) => {
                 return Err(UsageFault::UsageParseErrorWithOffset(
-                    "unexpected token".to_string(),
+                    format!("unexpected token '{}'", token),
                     *pos,
                 ))
             }
@@ -269,21 +261,32 @@ pub enum UsageFault {
     // TODO Improve error handling
     UsageParseError(String),
     UsageParseErrorWithOffset(String, usize),
+    ComposerError(ComposerErrorInner),
+}
+
+#[derive(Debug)]
+pub enum CanonicalizationFault {
+    // TODO Improve error handling
+    UsageParseError(String),
+    UsageParseErrorWithOffset(String, usize),
     MissingModules(Vec<(String, usize)>),
     ComposerError(ComposerErrorInner),
 }
 
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub fn canonicalize_usage(
     module_exports: &HashMap<String, IndexMap<String, Vec<(Export, Visibility)>>>,
-    module_mapping: &HashMap<String, IndexMap<String, Visibility>>,
+    module_mappings: &HashMap<String, IndexMap<String, Option<Visibility>>>,
     visibility_unsupported_modules: &HashSet<String>,
     from_module: &Option<String>,
     use_module_name: &str,
     use_item: &str,
     allow_ambiguous: bool,
     result: &mut Vec<(String, String, Option<Export>)>,
-) -> Result<(), UsageFault> {
-    if let Some(mapping) = module_mapping.get(use_module_name) {
+    seen_modules: &mut HashSet<String>,
+) -> Result<(), CanonicalizationFault> {
+    // TODO: Introduce backtracking to allow for recursive exports
+    if let Some(mapping) = module_mappings.get(use_module_name) {
         for (concrete_module, concrete_module_visibility) in mapping {
             if visibility_unsupported_modules.contains(concrete_module) {
                 result.push((concrete_module.to_string(), use_item.to_string(), None));
@@ -299,137 +302,248 @@ pub fn canonicalize_usage(
                             | Export::Struct
                             | Export::Override
                             | Export::Module => {
-                                result.push((
-                                    use_module_name.to_string(),
-                                    use_item.to_string(),
-                                    Some(export.clone()),
-                                ));
+                                if result
+                                    .iter()
+                                    .all(|(mdl, itm, _)| use_module_name != mdl || itm != use_item)
+                                {
+                                    result.push((
+                                        use_module_name.to_string(),
+                                        use_item.to_string(),
+                                        Some(export.clone()),
+                                    ));
+                                }
                             }
-                            Export::Use(module_name, original_name, _) => {
+                            Export::Use(module_name, original_name, _)
+                                if !seen_modules.contains(module_name) =>
+                            {
+                                seen_modules.insert(module_name.clone());
                                 // TODO: Add visibility modifiers
                                 canonicalize_usage(
                                     module_exports,
-                                    module_mapping,
+                                    module_mappings,
                                     visibility_unsupported_modules,
                                     &Some(concrete_module.to_string()),
                                     module_name,
                                     original_name.as_deref().unwrap_or(use_item),
                                     allow_ambiguous,
                                     result,
+                                    seen_modules,
                                 )?;
                             }
+                            Export::Use(_, _, _) => {}
                         }
                     }
                 } else {
                     // TODO: RETURN Visibilty error here
                 }
             } else {
-                return Err(UsageFault::MissingModules(vec![(
+                return Err(CanonicalizationFault::MissingModules(vec![(
                     concrete_module.to_string(),
                     0,
                 )]));
             }
         }
     } else {
-        return Err(UsageFault::MissingModules(vec![(
+        return Err(CanonicalizationFault::MissingModules(vec![(
             use_module_name.to_string(),
             0,
         )]));
     }
 
     if result.is_empty() {
-        return Err(UsageFault::UsageParseError(
-            format!("module {} item {} not found ", use_module_name, use_item).to_string(),
+        return Err(CanonicalizationFault::UsageParseError(
+            format!("module {} item {} not found", use_module_name, use_item).to_string(),
         ));
     }
     if !allow_ambiguous && result.len() > 1 {
-        return Err(UsageFault::UsageParseError(
-            format!("module {} not found", use_module_name).to_string(),
+        return Err(CanonicalizationFault::UsageParseError(
+            format!(
+                "module {} has an ambigous export for item {}",
+                use_module_name, use_item
+            )
+            .to_string(),
         ));
     }
 
     Ok(())
 }
 
-pub fn flatten_wildcard_use<'a>(
-    other_module_exports: &HashMap<String, IndexMap<String, Vec<(Export, Visibility)>>>,
-    module_mapping: &HashMap<String, IndexMap<String, Visibility>>,
+pub(crate) fn flatten_wildcard_use<'a>(
+    module_exports: &HashMap<String, IndexMap<String, Vec<(Export, Visibility)>>>,
+    module_mappings: &HashMap<String, IndexMap<String, Option<Visibility>>>,
+    module_wildcards: &HashMap<String, IndexSet<(String, Option<Visibility>)>>,
     visibility_unsupported_modules: &HashSet<String>,
+    crate_name: &Option<String>,
+    submodules: &IndexSet<String>,
     from_module: &Option<String>,
     module_name: &'a str,
-    allow_ambiguous: bool,
     declared_usages: &mut IndexMap<String, Vec<(String, Option<Visibility>, UseBehaviour)>>,
-    export_visibility: Option<Visibility>,
-) -> Result<(), UsageFault> {
-    if visibility_unsupported_modules.contains(module_name) {
-        return Err(UsageFault::UsageParseError(
-            format!(
-                "Cannot use wildcard imports when using module {} as it does not yet support visibility modifiers",
-                module_name
-            )
-            .to_string(),
-        ));
-    };
-    if let Some(mapping) = module_mapping.get(module_name) {
-        for (concrete_module, concrete_module_visibility) in mapping {
-            if let Some(exports) = other_module_exports.get(concrete_module) {
-                // TODO: Add visibility modifiers
-                if !allow_ambiguous && exports.values().any(|x| x.len() > 1) {
-                    return Err(UsageFault::UsageParseError(
-                        format!(
-                            "found export ambiguity when importing module {}",
-                            module_name
-                        )
-                        .to_string(),
+    allow_ambiguous: bool,
+) -> Result<(), CanonicalizationFault> {
+    let full_module_paths = get_full_paths(
+        module_name,
+        declared_usages,
+        crate_name,
+        from_module,
+        submodules,
+    );
+    if !allow_ambiguous && full_module_paths.len() > 1 {
+        return Err(CanonicalizationFault::UsageParseError(format!(
+            "Ambiguous paths {:?} for {}",
+            full_module_paths, module_name
+        )));
+    }
+
+    let mut seen_wildcards: HashSet<String> = HashSet::new();
+
+    for module_name in full_module_paths {
+        let mut add_exports = |exports: &IndexMap<String, Vec<(Export, Visibility)>> | -> Result<(), CanonicalizationFault> {
+        // TODO: Add visibility modifiers
+        if !allow_ambiguous && exports.values().any(|x| x.len() > 1) {
+            return Err(CanonicalizationFault::UsageParseError(
+                format!("found ambiguity when importing module {}", module_name).to_string(),
+            ));
+        }
+        for (exported_name, export) in exports.iter() {
+            for (e, visibility) in export {
+                // TODO evalutate visibility
+                let (module_name, name, use_behaviour) = match e {
+                    Export::Function(_)
+                    | Export::Variable
+                    | Export::Constant
+                    | Export::Alias
+                    | Export::Struct
+                    | Export::Override
+                    | Export::Module => (
+                        module_name.to_string(),
+                        exported_name.to_string(),
+                        UseBehaviour::ModuleSystem,
+                    ),
+                    Export::Use(module_name, canonical_name, use_behaviour) => (
+                        module_name.to_string(),
+                        canonical_name.as_ref().unwrap_or(exported_name).to_string(),
+                        use_behaviour.clone(),
+                    ),
+                };
+                declared_usages
+                    .entry(exported_name.to_string())
+                    .or_default()
+                    .push((
+                        format!("{}::{}", module_name, name),
+                        Some(visibility.clone()),
+                        use_behaviour,
                     ));
-                }
-                for (exported_name, export) in exports.iter() {
-                    for (e, visibility) in export {
-                        // TODO evalutate visibility
-                        let (module_name, name, use_behaviour) = match e {
-                            Export::Function(_)
-                            | Export::Variable
-                            | Export::Constant
-                            | Export::Alias
-                            | Export::Struct
-                            | Export::Override
-                            | Export::Module => (
-                                module_name.to_string(),
-                                exported_name.to_string(),
-                                UseBehaviour::ModuleSystem,
-                            ),
-                            Export::Use(module_name, canonical_name, use_behaviour) => (
-                                module_name.to_string(),
-                                canonical_name.as_ref().unwrap_or(exported_name).to_string(),
-                                use_behaviour.clone(),
-                            ),
-                        };
-                        declared_usages
-                            .entry(exported_name.to_string())
-                            .or_default()
-                            .push((
-                                format!("{}::{}", module_name, name),
-                                export_visibility.clone(),
-                                use_behaviour,
-                            ));
-                    }
-                }
-            } else {
-                return Err(UsageFault::MissingModules(vec![(
-                    concrete_module.to_string(),
-                    0,
-                )]));
             }
         }
-        Ok(())
-    } else {
-        Err(UsageFault::MissingModules(vec![(
-            module_name.to_string(),
-            0,
-        )]))
+        return Ok(());
+    };
+        if visibility_unsupported_modules.contains(&module_name) {
+            return Err(CanonicalizationFault::UsageParseError(
+                format!(
+                    "Cannot use wildcard imports when using module {} as it does not yet support visibility modifiers",
+                    module_name
+                )
+                .to_string(),
+            ));
+        };
+        if let Some(mapping) = module_mappings.get(&module_name) {
+            for (concrete_module, concrete_module_visibility) in mapping {
+                if let Some(exports) = module_exports.get(concrete_module) {
+                    add_exports(
+                        &exports
+                            .iter()
+                            .map(|(symbol_name, export)| {
+                                (
+                                    symbol_name.to_owned(),
+                                    export
+                                        .iter()
+                                        .filter(|(export, _)| match export {
+                                            Export::Use(m, _, _)
+                                                if Some(m) == from_module.as_ref() =>
+                                            {
+                                                false
+                                            }
+                                            _ => true,
+                                        })
+                                        .cloned()
+                                        .collect(),
+                                )
+                            })
+                            .collect(),
+                    )?;
+                    let mut stack: Vec<(String, Option<Visibility>)> = module_wildcards
+                        .get(concrete_module)
+                        .cloned()
+                        .unwrap_or_else(|| IndexSet::new())
+                        .into_iter()
+                        .collect();
+                    loop {
+                        if let Some((wildcard_module, visiblity)) = stack.pop() {
+                            if Some(&wildcard_module) == from_module.as_ref() {
+                                continue;
+                            }
+                            // TODO Evaluate visibility
+                            if let Some(mapping) = module_mappings.get(&wildcard_module) {
+                                if matches!(visiblity, Some(_)) {
+                                    for (mapping, _) in mapping.iter() {
+                                        // TODO Evaluate visibility
+                                        if !seen_wildcards.contains(mapping) {
+                                            seen_wildcards.insert(mapping.to_string());
+                                            if let Some(exports) = module_exports.get(mapping) {
+                                                add_exports(exports)?;
+                                                stack.extend(
+                                                module_wildcards
+                                                    .get(mapping)
+                                                    .map(|x| {
+                                                        x.iter().cloned().filter(|(_, viz)| matches!(viz, Some(_))).collect::<Vec<(
+                                                            String,
+                                                            Option<Visibility>,
+                                                        )>>(
+                                                        )
+                                                    })
+                                                    .unwrap_or_default(),
+                                            );
+                                            } else {
+                                                return Err(CanonicalizationFault::MissingModules(
+                                                    vec![(mapping.to_string(), 0)],
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                return Err(CanonicalizationFault::MissingModules(vec![(
+                                    module_name.to_string(),
+                                    0,
+                                )]));
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    return Err(CanonicalizationFault::MissingModules(vec![(
+                        concrete_module.to_string(),
+                        0,
+                    )]));
+                }
+            }
+            return Ok(());
+        } else {
+            return Err(CanonicalizationFault::MissingModules(vec![(
+                module_name.to_string(),
+                0,
+            )]));
+        }
     }
+
+    return Err(CanonicalizationFault::UsageParseError(format!(
+        "No valid canonical paths for {}",
+        module_name
+    )));
 }
 
+#[allow(clippy::type_complexity)]
 pub fn get_full_paths(
     ident: &str,
     declared_usages: &IndexMap<String, Vec<(String, Option<Visibility>, UseBehaviour)>>,
@@ -440,60 +554,93 @@ pub fn get_full_paths(
     let (first, residual) = ident.split_once("::").unwrap_or((ident, ""));
     let full_paths = if first == "self" && from_module.is_some() {
         if residual.is_empty() {
-            vec![from_module.clone().unwrap().to_string()]
+            get_full_paths(
+                &from_module.clone().unwrap(),
+                declared_usages,
+                crate_name,
+                from_module,
+                submodules,
+            )
         } else {
-            vec![format!("{}::{}", from_module.as_deref().unwrap(), residual)]
+            get_full_paths(
+                &format!("{}::{}", from_module.as_deref().unwrap(), residual),
+                declared_usages,
+                crate_name,
+                from_module,
+                submodules,
+            )
         }
     } else if first == "crate" && crate_name.is_some() {
         if residual.is_empty() {
-            vec![crate_name.clone().unwrap().to_string()]
+            get_full_paths(
+                &crate_name.clone().unwrap(),
+                declared_usages,
+                crate_name,
+                from_module,
+                submodules,
+            )
         } else {
-            vec![format!("{}::{}", crate_name.as_deref().unwrap(), residual)]
+            get_full_paths(
+                &format!("{}::{}", crate_name.as_deref().unwrap(), residual),
+                declared_usages,
+                crate_name,
+                from_module,
+                submodules,
+            )
         }
     } else if first == "super" && from_module.is_some() {
         // TODO RETURN AN ERROR IF NO SUPER MODULE
         let (spr, _) = from_module.as_deref().unwrap().rsplit_once("::").unwrap();
         if residual.is_empty() {
-            vec![spr.to_string()]
+            get_full_paths(spr, declared_usages, crate_name, from_module, submodules)
         } else {
-            vec![format!("{}::{}", spr, residual)]
-        }
-    } else if submodules.contains(first) && from_module.is_some() {
-        if residual.is_empty() {
-            vec![format!(
-                "{}::{}::{}",
-                from_module.as_deref().unwrap(),
-                first,
-                residual
-            )]
-        } else {
-            vec![format!("{}::{}", from_module.as_deref().unwrap(), first)]
+            get_full_paths(
+                &format!("{}::{}", spr, residual),
+                declared_usages,
+                crate_name,
+                from_module,
+                submodules,
+            )
         }
     } else {
-        let result = declared_usages
-            .get(first)
-            .map(|items| {
-                if residual.is_empty() {
-                    items.iter().map(|(path, _, _)| path).cloned().collect()
-                } else {
-                    items
-                        .iter()
-                        .map(|(path, _, _)| format!("{}::{}", path, residual))
-                        .collect()
-                }
-            })
-            .unwrap_or_else(|| {
-                if residual.is_empty() {
-                    vec![first.to_owned()]
-                } else {
-                    vec![format!("{}::{}", first.to_owned(), residual)]
-                }
-            });
-        result
+        if submodules.contains(first) && from_module.is_some() {
+            if residual.is_empty() {
+                vec![format!("{}::{}", from_module.as_deref().unwrap(), first)]
+            } else {
+                vec![format!(
+                    "{}::{}::{}",
+                    from_module.as_deref().unwrap(),
+                    first,
+                    residual
+                )]
+            }
+        } else {
+            let result = declared_usages
+                .get(first)
+                .map(|items| {
+                    if residual.is_empty() {
+                        items.iter().map(|(path, _, _)| path).cloned().collect()
+                    } else {
+                        items
+                            .iter()
+                            .map(|(path, _, _)| format!("{}::{}", path, residual))
+                            .collect()
+                    }
+                })
+                .unwrap_or_else(|| {
+                    if residual.is_empty() {
+                        vec![first.to_owned()]
+                    } else {
+                        vec![format!("{}::{}", first.to_owned(), residual)]
+                    }
+                });
+            result
+        }
     };
     full_paths
 }
 
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn substitute_with_canonical_identifiers(
     input: &str,
     offset: usize,
@@ -501,12 +648,12 @@ pub fn substitute_with_canonical_identifiers(
     from_module: &Option<String>,
     submodules: &IndexSet<String>,
     module_exports: &HashMap<String, IndexMap<String, Vec<(Export, Visibility)>>>,
-    module_mapping: &HashMap<String, IndexMap<String, Visibility>>,
+    module_mappings: &HashMap<String, IndexMap<String, Option<Visibility>>>,
     visibility_unsupported_modules: &HashSet<String>,
     declared_usages: &IndexMap<String, Vec<(String, Option<Visibility>, UseBehaviour)>>,
     used_usages: &mut IndexMap<String, UseDefWithOffset>,
     allow_ambiguous: bool,
-) -> Result<String, UsageFault> {
+) -> Result<String, CanonicalizationFault> {
     let tokens = Tokenizer::new(input, true);
     let mut output = String::with_capacity(input.len());
     let mut in_substitution_position = true;
@@ -519,7 +666,7 @@ pub fn substitute_with_canonical_identifiers(
                         get_full_paths(ident, declared_usages, crate_name, from_module, submodules);
 
                     if !allow_ambiguous && full_paths.len() > 1 {
-                        return Err(UsageFault::UsageParseErrorWithOffset(
+                        return Err(CanonicalizationFault::UsageParseErrorWithOffset(
                             "Ambiguous paths".to_string(),
                             offset + token_pos,
                         ));
@@ -528,15 +675,17 @@ pub fn substitute_with_canonical_identifiers(
                     for full_path in full_paths {
                         if let Some((module, item)) = full_path.rsplit_once("::") {
                             let mut canonicalized_result = Default::default();
+                            let mut seen_modules = HashSet::new();
                             canonicalize_usage(
                                 module_exports,
-                                module_mapping,
+                                module_mappings,
                                 visibility_unsupported_modules,
                                 from_module,
                                 module,
                                 item,
                                 allow_ambiguous,
                                 &mut canonicalized_result,
+                                &mut seen_modules,
                             )?;
 
                             for (canonical_module, canonical_item, _) in canonicalized_result {
@@ -592,91 +741,31 @@ pub fn substitute_with_canonical_identifiers(
     Ok(output)
 }
 
-pub fn gather_direct_usages(
-    input: &str,
-    offset: usize,
-    crate_name: &Option<String>,
-    from_module: &Option<String>,
-    declared_usages: &IndexMap<String, Vec<(String, Option<Visibility>, UseBehaviour)>>,
-    used_usages: &mut IndexMap<String, UseDefWithOffset>,
-    submodules: &IndexSet<String>,
-) -> Result<(), usize> {
-    let tokens = Tokenizer::new(input, true);
-    let mut in_substitution_position = true;
-    for token in tokens {
-        match token {
-            Token::Identifier(ident, token_pos) if in_substitution_position => {
-                let full_paths =
-                    get_full_paths(ident, declared_usages, crate_name, from_module, submodules);
-
-                for full_path in full_paths {
-                    if let Some((module, item)) = full_path.rsplit_once("::") {
-                        if Some(module) != from_module.as_deref() {
-                            used_usages
-                                .entry(module.to_owned())
-                                .or_insert_with(|| UseDefWithOffset {
-                                    definition: UseDefinition {
-                                        module: module.to_owned(),
-                                        ..Default::default()
-                                    },
-                                    offset: offset + token_pos,
-                                })
-                                .definition
-                                .items
-                                .push(item.to_string());
-                        }
-                    }
-                }
-            }
-            Token::Other(other, _) if other == '.' || other == '@' => {
-                in_substitution_position = false;
-                continue;
-            }
-            _ => (),
-        };
-
-        in_substitution_position = true;
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 fn test_parse(
     input: &str,
 ) -> Result<IndexMap<String, Vec<(String, Option<Visibility>, UseBehaviour)>>, String> {
     let mut declared_imports = IndexMap::default();
     let mut declared_extensions = IndexSet::default();
+    let mut declared_wildcard_usages = IndexSet::default();
     let mut declared_patches = IndexSet::default();
-    let module_exports = HashMap::default();
-    let module_mapping = HashMap::default();
-    let visibility_unsupported = HashSet::default();
+    let mut submodules = IndexSet::default();
 
     parse_uses(
         input,
-        &module_exports,
-        &module_mapping,
-        &visibility_unsupported,
         &None,
         &None,
+        &submodules,
         &mut declared_imports,
+        &mut declared_wildcard_usages,
         &mut declared_extensions,
         &mut declared_patches,
-        true,
     )
     .map_err(|err| match err {
         UsageFault::UsageParseError(err) => ComposerErrorInner::UsageParseError(err, 0).to_string(),
         UsageFault::UsageParseErrorWithOffset(err, offset) => {
             ComposerErrorInner::UsageParseError(err, offset).to_string()
         }
-        UsageFault::MissingModules(modules) => format!(
-            "Missing modules {}",
-            modules
-                .iter()
-                .map(|(module, offset)| format!("{module}::{offset}"))
-                .collect::<Vec<String>>()
-                .join(", ")
-        ),
         UsageFault::ComposerError(err) => err.to_string(),
     })?;
     Ok(declared_imports)

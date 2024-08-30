@@ -8,7 +8,7 @@ use codespan_reporting::{
 use thiserror::Error;
 use tracing::trace;
 
-use super::{preprocess::PreprocessOutput, Composer, ShaderDefValue};
+use super::{Composer, ShaderDefValue};
 use crate::{compose::SPAN_SHIFT, redirect::RedirectError};
 
 #[derive(Debug)]
@@ -35,7 +35,7 @@ impl ErrSource {
 
     pub fn source<'a>(&'a self, composer: &'a Composer) -> Cow<'a, String> {
         match self {
-            ErrSource::Module { name, defs, .. } => {
+            ErrSource::Module { name, .. } => {
                 let module_set = &composer.module_sets.get(name).unwrap();
                 Cow::Owned(module_set.sanitized_source.to_owned())
             }
@@ -64,6 +64,8 @@ pub enum ComposerErrorInner {
     UsageParseError(String, usize),
     #[error("required module '{0}' not found")]
     ModuleNotFound(String, usize),
+    #[error("required crate '{0}' not found")]
+    CrateNotFound(String),
     #[error("required module item '{0}::{1}' not found")]
     ModuleItemNotFound(String, String, usize),
     #[error("{0}")]
@@ -266,6 +268,9 @@ impl ComposerError {
                 return format!(
                     "{path}: no #define_import_path declaration found in composable module"
                 );
+            }
+            ComposerErrorInner::CrateNotFound(crate_name) => {
+                return format!("missing crate '{crate_name}'");
             }
             ComposerErrorInner::InvalidIdentifier { at, .. } => (
                 vec![Label::primary((), map_span(at.to_range().unwrap_or(0..0)))
