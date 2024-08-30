@@ -561,16 +561,6 @@ impl PreprocessResolver {
                                 items: vec![],
                             },
                             offset: 0,
-                        });
-                } else {
-                    self.usages
-                        .entry(module.clone())
-                        .or_insert_with(|| UseDefWithOffset {
-                            definition: UseDefinition {
-                                module: module.clone(),
-                                items: vec![],
-                            },
-                            offset: 0,
                         })
                         .definition
                         .items
@@ -1410,7 +1400,7 @@ fn parse_exports_and_submodules(
                             .map(|x| x.as_str())
                             .unwrap_or_default()
                             .len()
-                            - 1
+                            .saturating_sub(1)
                     ),
                     cap.name("lead").unwrap().as_str(),
                     " ".repeat(cap.name("mod_keyword").unwrap().as_str().len()),
