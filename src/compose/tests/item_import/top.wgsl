@@ -1,5 +1,5 @@
-#import consts X, double
-#import consts Y
+use consts X, double
+use consts Y
 
 pub fn main() -> u32 {
     return double(X);

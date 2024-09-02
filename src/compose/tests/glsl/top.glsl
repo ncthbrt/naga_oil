@@ -1,6 +1,6 @@
 #version 450
 
-#import wgsl_module
+use wgsl_module
 
 
 

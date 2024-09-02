@@ -1,4 +1,4 @@
-#import include as Inc
+use include as Inc
 
 @fragment
 pub fn fragment(

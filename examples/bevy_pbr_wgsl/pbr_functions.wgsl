@@ -1,13 +1,13 @@
 #define_import_path bevy_pbr::pbr_functions
 
-#import bevy_pbr::pbr_types as PbrTypes
-#import bevy_pbr::mesh_types as MeshTypes
-#import bevy_pbr::mesh_bindings as MeshBindings
-#import bevy_pbr::mesh_view_types as ViewTypes
-#import bevy_pbr::mesh_view_bindings as ViewBindings
-#import bevy_pbr::lighting as Lighting
-#import bevy_pbr::clustered_forward as Clustering
-#import bevy_pbr::shadows as Shadows
+use bevy_pbr::pbr_types as PbrTypes
+use bevy_pbr::mesh_types as MeshTypes
+use bevy_pbr::mesh_bindings as MeshBindings
+use bevy_pbr::mesh_view_types as ViewTypes
+use bevy_pbr::mesh_view_bindings as ViewBindings
+use bevy_pbr::lighting as Lighting
+use bevy_pbr::clustered_forward as Clustering
+use bevy_pbr::shadows as Shadows
 
 // NOTE: This ensures that the world_normal is normalized and if
 // vertex tangents and normal maps then normal mapping may be applied.

@@ -62,13 +62,13 @@ impl Default for Preprocessor {
             def_regex: Regex::new(r"#\s*([\w|\d|_]+)").unwrap(),
             def_regex_delimited: Regex::new(r"#\s*\{([\w|\d|_]+)\}").unwrap(),
             use_regex: Regex::new(
-                r"^(\s*#\s*import\s)|((\s*(pub\s+)?use\s(patchset\s)?))|(\s*extend\s)",
+                r"^(\s*(pub\s+)?use\s)|(\s*extend\s)",
             )
             .unwrap(),
             define_import_path_regex: Regex::new(r"^\s*#\s*define_import_path\s+(?P<import_path>[^\s]+)").unwrap(),
             define_shader_def_regex: Regex::new(r"^\s*#\s*define\s+([\w|\d|_]+)\s*([-\w|\d]+)?")
                 .unwrap(),
-            pub_fn_regex: Regex::new(r"(?P<lead>(^|\n)\s*)(?P<pub_keyword>pub\s+)((?P<virtual_keyword>virtual\s+)|(?P<patch_keyword>patch\s+))?(?P<fn_keyword>fn\s+)(?<target_function>[^\s]+)(?P<trail>\s*)\(",).unwrap(),
+            pub_fn_regex: Regex::new(r"(?P<lead>(^|\n)\s*)(?P<pub_keyword>pub\s+)((?P<virtual_keyword>virtual\s+)|(?P<extend_keyword>override\s+))?(?P<fn_keyword>fn\s+)(?<target_function>[^\s]+)(?P<trail>\s*)\(",).unwrap(),
             pub_var_regex: Regex::new(r"(?P<lead>(^|\n)\s*)(?P<pub_keyword>pub\s+)(?P<var_keyword>var\s*)(?P<var_arguments><.+?>\s*)?(?P<target_var>[^\:\s]+)").unwrap(),
             pub_struct_regex: Regex::new(r"(?P<lead>(^|\n)\s*)(?P<pub_keyword>pub\s+)(?P<struct_keyword>struct\s+)(?P<target_struct>[^\s]+)").unwrap(),
             pub_alias_regex: Regex::new(r"(?P<lead>(^|\n)\s*)(?P<pub_keyword>pub\s+)(?P<alias_keyword>alias\s+)(?P<target_alias>[^\s]+)(\s*)\=").unwrap(),
@@ -273,10 +273,9 @@ pub struct PreprocessOutput {
     pub preprocessed_source: String,
     pub exports: IndexMap<String, (Export, Visibility)>,
     pub submodules: IndexSet<String>,
-    pub patchsets: IndexSet<String>,
     pub extensions: IndexSet<String>,
     pub usages: Vec<UseDefWithOffset>,
-    pub patches: Vec<(String, String)>,
+    pub extended_functions: Vec<(Option<String>, String)>,
     // shader def values bound to this module
     pub shader_defs: HashMap<String, ShaderDefValue>,
     // list of shader_defs that can affect this crate
@@ -298,8 +297,7 @@ enum PreprocessState {
     ProcessingWildcard {
         module_name: String,
     },
-    ProcessForcedPatchsets,
-    CanonicalizingPatches,
+    CanonicalizingExtendedFunctions,
     StartProcessingIdentifierSubstitution,
     ProcessIdentifierSubstitution,
     SubstituteIdentifiers {
@@ -322,12 +320,10 @@ pub struct PreprocessResolver {
     original_string: String,
     final_string: String,
     offset: usize,
-    patchsets: IndexSet<String>,
-    processed_patches: Vec<(String, String)>,
-    unprocessed_patches: Vec<(String, usize)>,
+    unprocessed_extended_functions: Vec<(String, usize)>,
     extensions: IndexSet<String>,
+    extended_functions: Vec<(Option<String>, String)>,
     unprocessed_wildcards: IndexSet<(String, Option<Visibility>)>,
-    forced_patchsets: IndexSet<String>,
     usages: IndexMap<String, UseDefWithOffset>,
     declared_usages: IndexMap<String, Vec<(String, Option<Visibility>, UseBehaviour)>>,
     exports: IndexMap<String, (Export, Visibility)>,
@@ -613,14 +609,14 @@ impl PreprocessResolver {
                         final_string,
                         exports,
                         submodules,
-                        patches,
+                        extended_functions,
                     } = parse_exports_and_submodules(
                         &self.regexes,
                         self.language,
                         &self.final_string,
                     )?;
-                    self.unprocessed_patches = patches;
                     self.final_string = final_string;
+                    self.unprocessed_extended_functions = extended_functions;
                     self.submodules.extend(submodules);
                     let module_name = self.module_name.clone().unwrap_or_default();
 
@@ -722,7 +718,6 @@ impl PreprocessResolver {
                         &mut declared_usages,
                         &mut declared_wildcard_usages,
                         &mut self.extensions,
-                        &mut self.patchsets,
                     );
                     match uses_result {
                         Ok(()) => {
@@ -790,12 +785,15 @@ impl PreprocessResolver {
                             module_name: module.clone(),
                         };
                     } else {
-                        self.state = PreprocessState::ProcessForcedPatchsets;
+                        self.state = PreprocessState::CanonicalizingExtendedFunctions;
                     }
                     continue 'processor;
                 }
                 PreprocessState::ProcessingWildcard { module_name } => {
-                    let mut declared_usages = IndexMap::default();
+                    let mut declared_usages: IndexMap<
+                        String,
+                        Vec<(String, Option<Visibility>, UseBehaviour)>,
+                    > = IndexMap::default();
                     match flatten_wildcard_use(
                         module_exports,
                         module_mappings,
@@ -855,179 +853,26 @@ impl PreprocessResolver {
                         }
                     }
                 }
-                PreprocessState::ProcessForcedPatchsets => {
-                    let unprocessed_patchsets: Vec<(String, usize)> = self
-                        .forced_patchsets
-                        .iter()
-                        .filter(|x| {
-                            !module_mappings.contains_key(x.as_str())
-                                || !module_exports.contains_key(x.as_str())
-                        })
-                        .cloned()
-                        .map(|x| (x, 0))
-                        .collect();
-                    if !unprocessed_patchsets.is_empty() {
-                        return Ok(PreprocessStep::Miss(PreprocessMiss::MissingModules(
-                            unprocessed_patchsets,
-                        )));
-                    }
-                    self.state = PreprocessState::CanonicalizingPatches;
-                    continue 'processor;
-                }
-                PreprocessState::CanonicalizingPatches => {
-                    for (idx, (patch, offset)) in self
-                        .unprocessed_patches
+                PreprocessState::CanonicalizingExtendedFunctions => {
+                    self.state = PreprocessState::StartProcessingIdentifierSubstitution;
+                    for (idx, (extended_function, _)) in self
+                        .unprocessed_extended_functions
                         .clone()
                         .iter_mut()
                         .enumerate()
                         .rev()
                     {
-                        let full_paths = parse_usages::get_full_paths(
-                            patch,
-                            &self.declared_usages,
-                            &self.crate_name,
-                            &self.module_name,
-                            &self.submodules,
-                        );
+                        let full_path = match &self.module_name {
+                            Some(module_name) => format!("{}::{}", module_name, extended_function),
+                            None => extended_function.to_owned(),
+                        };
+                        let (module, fn_name) = full_path
+                            .rsplit_once("::")
+                            .map(|(module, fn_name)| (Some(module.to_string()), fn_name))
+                            .unwrap_or_else(|| (None, &full_path));
 
-                        if let (Some(_), true) = (&self.shader_defs, full_paths.len() > 1) {
-                            return Err(map_err(
-                                ComposerErrorInner::UsageParseError(
-                                    "Ambiguous paths".to_string(),
-                                    *offset,
-                                ),
-                                ErrSource::Constructing {
-                                    offset: self.offset,
-                                    path: self.module_path.clone(),
-                                    source: self.original_source().to_string(),
-                                },
-                            ));
-                        }
-
-                        if let Some((module, func)) = patch.rsplit_once("::") {
-                            let mut result = Default::default();
-                            let mut seen_modules = HashSet::new();
-                            match canonicalize_usage(
-                                module_exports,
-                                module_mappings,
-                                visibility_unsupported_modules,
-                                &self.module_name,
-                                module,
-                                func,
-                                self.shader_defs.is_none(),
-                                &mut result,
-                                &mut seen_modules,
-                            ) {
-                                Ok(_) => {
-                                    let (canonical_module, canonical_item, export) =
-                                        result.first().unwrap();
-                                    #[cfg(not(feature = "patch_any"))]
-                                    {
-                                        if let Some(Export::Function(OverrideMode::Virtual)) =
-                                            export
-                                        {
-                                        } else {
-                                            return Err(map_err(
-                                                ComposerErrorInner::PatchNotVirtual {
-                                                    name: format!("{module}::{func}"),
-                                                    pos: *offset,
-                                                },
-                                                ErrSource::Constructing {
-                                                    path: self.module_path.to_owned(),
-                                                    source: self.original_string.to_owned(),
-                                                    offset: *offset,
-                                                },
-                                            ));
-                                        }
-                                    }
-                                    if let Some(export) = self.exports.shift_remove(patch) {
-                                        self.exports.insert(
-                                            format!("{canonical_module}::{canonical_item}"),
-                                            export,
-                                        );
-                                    }
-                                    self.unprocessed_patches.remove(idx);
-                                    self.processed_patches.push((
-                                        canonical_module.to_string(),
-                                        canonical_item.to_string(),
-                                    ));
-                                    let fn_regex = Regex::new(&format!("(?P<lead>\\s*)(?P<fn_keyword>fn\\s+)(?<target>{})(?P<trail>\\s*)\\(", patch)).unwrap();
-                                    self.final_string = fn_regex
-                                        .replace_all(&self.final_string, |cap: &regex::Captures| {
-                                            let rename = format!(
-                                                "{}{}",
-                                                canonical_item,
-                                                Composer::decorate_vrt(canonical_module)
-                                            );
-                                            format!(
-                                                "{}{}{}{}(",
-                                                cap.name("lead").unwrap().as_str(),
-                                                cap.name("fn_keyword").unwrap().as_str(),
-                                                rename,
-                                                cap.name("trail").unwrap().as_str()
-                                            )
-                                        })
-                                        .to_string();
-                                    self.usages
-                                        .entry(canonical_module.to_string())
-                                        .or_insert(UseDefWithOffset {
-                                            definition: UseDefinition {
-                                                module: canonical_module.clone(),
-                                                items: vec![],
-                                            },
-                                            offset: 0,
-                                        })
-                                        .definition
-                                        .items
-                                        .push(canonical_item.to_string());
-                                    Ok(())
-                                }
-                                Err(CanonicalizationFault::UsageParseError(err)) => Err(map_err(
-                                    ComposerErrorInner::UsageParseError(err, 0),
-                                    ErrSource::Constructing {
-                                        path: self.module_path.to_owned(),
-                                        source: self.original_string.to_owned(),
-                                        offset: *offset,
-                                    },
-                                )),
-                                Err(CanonicalizationFault::UsageParseErrorWithOffset(
-                                    err,
-                                    offset,
-                                )) => Err(map_err(
-                                    ComposerErrorInner::UsageParseError(err, offset),
-                                    ErrSource::Constructing {
-                                        path: self.module_path.to_owned(),
-                                        source: self.original_string.to_owned(),
-                                        offset,
-                                    },
-                                )),
-                                Err(CanonicalizationFault::MissingModules(modules)) => {
-                                    return Ok(PreprocessStep::Miss(
-                                        PreprocessMiss::MissingModules(modules),
-                                    ))
-                                }
-                                Err(CanonicalizationFault::ComposerError(err)) => Err(map_err(
-                                    err,
-                                    ErrSource::Constructing {
-                                        path: self.module_path.to_owned(),
-                                        source: self.original_string.to_owned(),
-                                        offset: self.offset,
-                                    },
-                                )),
-                            }?;
-                        } else {
-                            return Err(map_err(
-                                ComposerErrorInner::UsageParseError(
-                                    format!("patch {} needs to have a module in scope", patch),
-                                    0,
-                                ),
-                                ErrSource::Constructing {
-                                    path: self.module_path.to_owned(),
-                                    source: self.original_string.to_owned(),
-                                    offset: self.offset,
-                                },
-                            ));
-                        }
+                        self.unprocessed_extended_functions.remove(idx);
+                        self.extended_functions.push((module, fn_name.to_string()));
                     }
                     self.state = PreprocessState::StartProcessingIdentifierSubstitution;
                 }
@@ -1059,10 +904,9 @@ impl PreprocessResolver {
                         preprocessed_source: self.final_string.clone(),
                         exports: self.exports.clone(),
                         submodules: self.submodules.clone(),
-                        patchsets: self.patchsets.clone(),
                         extensions: self.extensions.clone(),
                         usages: self.usages.values().cloned().collect(),
-                        patches: self.processed_patches.clone(),
+                        extended_functions: self.extended_functions.clone(),
                         shader_defs: self.derived_shader_defs.clone(),
                         effective_defs: self.effective_defs.clone(),
                     };
@@ -1162,7 +1006,7 @@ struct ParseExportsAndSubmodulesOutput {
     final_string: String,
     exports: IndexMap<String, Vec<(Export, Visibility)>>,
     submodules: IndexSet<String>,
-    patches: Vec<(String, usize)>,
+    extended_functions: Vec<(String, usize)>,
 }
 
 fn get_submodules(
@@ -1189,7 +1033,7 @@ fn parse_exports_and_submodules(
     source: &str,
 ) -> Result<ParseExportsAndSubmodulesOutput, ComposerError> {
     let mut exports: IndexMap<String, Vec<(Export, Visibility)>> = Default::default();
-    let mut patches: Vec<(String, usize)> = Default::default();
+    let mut extended_functions: Vec<(String, usize)> = Default::default();
     let source = Cow::Borrowed(source);
     let source = if language == ShaderLanguage::Wgsl {
         regexes
@@ -1197,16 +1041,17 @@ fn parse_exports_and_submodules(
             .replace_all(&source, |cap: &regex::Captures| {
                 let target_function = cap.name("target_function").unwrap().as_str();
 
-                let patch_cap = cap.name("patch_keyword");
-                let override_mode = if cap.name("virtual_keyword").is_some() || patch_cap.is_some()
+                let extend_cap = cap.name("extend_keyword");
+
+                let override_mode = if cap.name("virtual_keyword").is_some() || extend_cap.is_some()
                 {
                     OverrideMode::Virtual
                 } else {
                     OverrideMode::Static
                 };
 
-                if patch_cap.is_some() {
-                    patches.push((
+                if extend_cap.is_some() {
+                    extended_functions.push((
                         target_function.to_string(),
                         cap.name("target_function").unwrap().start(),
                     ));
@@ -1224,7 +1069,7 @@ fn parse_exports_and_submodules(
                     cap.name("lead").unwrap().as_str(),
                     " ".repeat(cap.name("pub_keyword").map(|x| x.as_str()).unwrap().len()),
                     " ".repeat(
-                        cap.name("patch_keyword")
+                        cap.name("extend_keyword")
                             .map(|x| x.as_str())
                             .unwrap_or_default()
                             .len()
@@ -1411,7 +1256,7 @@ fn parse_exports_and_submodules(
         final_string: source.to_string(),
         exports,
         submodules,
-        patches,
+        extended_functions,
     })
 }
 
@@ -1437,11 +1282,9 @@ impl Preprocessor {
         crate_name: Option<String>,
         module_name: Option<String>,
         module_path: String,
-        additional_patchsets: &[String],
     ) -> PreprocessResolver {
         let declared_usages = IndexMap::new();
         let extensions = IndexSet::new();
-        let patchsets = additional_patchsets.iter().cloned().collect();
         let scope = Scope::new();
         let final_string = String::new();
         let offset = 0;
@@ -1465,16 +1308,14 @@ impl Preprocessor {
             scope,
             final_string,
             offset,
-            patchsets,
             extensions,
             usages: Default::default(),
             declared_usages,
             state: PreprocessState::ProcessDirectives,
             exports: Default::default(),
+            unprocessed_extended_functions: Default::default(),
+            extended_functions: Default::default(),
             submodules: Default::default(),
-            forced_patchsets: additional_patchsets.iter().cloned().collect(),
-            unprocessed_patches: Default::default(),
-            processed_patches: Default::default(),
             original_string: shader_str.to_string(),
             unprocessed_wildcards: Default::default(),
             derived_shader_defs: shader_defs.unwrap_or_default(),
@@ -1575,7 +1416,6 @@ fn vertex(
                 None,
                 None,
                 "/tests/abc.wgsl".to_string(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -1688,7 +1528,6 @@ fn vertex(
                 None,
                 None,
                 "/tests/abc.wgsl".to_string(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -1722,7 +1561,6 @@ fn vertex(
                 None,
                 None,
                 "/tests/abc.wgsl".to_string(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -1756,7 +1594,6 @@ fn vertex(
                 None,
                 None,
                 "/tests/abc.wgsl".to_string(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -1781,7 +1618,6 @@ fn vertex(
                 None,
                 None,
                 "/tests/abc.wgsl".to_string(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -1899,7 +1735,6 @@ fn vertex(
                 None,
                 None,
                 "/tests/abc.wgsl".to_string(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -1932,7 +1767,6 @@ fn vertex(
                 None,
                 None,
                 "/tests/abc.wgsl".to_string(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -2052,7 +1886,6 @@ fn vertex(
                 None,
                 None,
                 "/tests/abc.wgsl".to_owned(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -2085,7 +1918,6 @@ fn vertex(
                 None,
                 None,
                 "/tests/abc.wgsl".to_string(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -2118,7 +1950,6 @@ fn vertex(
                 None,
                 None,
                 "/tests/abc.wgsl".to_string(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -2142,7 +1973,6 @@ fn vertex(
                 None,
                 None,
                 "/tests/abc.wgsl".to_string(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -2238,7 +2068,6 @@ fn vertex(
                 None,
                 None,
                 "/tests/abc.wgsl".to_string(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -2291,7 +2120,6 @@ defined
                 None,
                 None,
                 "/tests/abc.wgsl".to_string(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -2359,7 +2187,6 @@ bool: false
                 None,
                 None,
                 "/tests/abc.wgsl".to_owned(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -2421,7 +2248,6 @@ fn vertex(
                 None,
                 None,
                 "/tests/abc.wgsl".to_string(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -2517,7 +2343,6 @@ fn vertex(
                 None,
                 None,
                 "/tests/abc.wgsl".to_string(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -2583,7 +2408,6 @@ fn vertex(
                 None,
                 None,
                 "/tests/abc.wgsl".to_string(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -2647,7 +2471,6 @@ fn vertex(
                 None,
                 None,
                 "/tests/abc.wgsl".to_string(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -2710,7 +2533,6 @@ fn vertex(
                 None,
                 None,
                 "/tests/abc.wgsl".to_string(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -2779,7 +2601,6 @@ fn vertex(
                 None,
                 None,
                 "/tests/abc.wgsl".to_string(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -2848,7 +2669,6 @@ fn vertex(
                 None,
                 None,
                 "/tests/abc.wgsl".to_string(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -2899,7 +2719,6 @@ fail 3
                 None,
                 None,
                 "/tests/abc.wgsl".to_string(),
-                &[],
             )
             .next(
                 &mut Default::default(),
@@ -2950,7 +2769,6 @@ fail 3
                 None,
                 None,
                 "/tests/abc.wgsl".to_string(),
-                &[],
             )
             .next(
                 &mut Default::default(),

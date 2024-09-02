@@ -1,4 +1,4 @@
-#import inc as Inc
+use inc as Inc
 
 pub fn main() -> f32 {
     let x = Inc::hello();

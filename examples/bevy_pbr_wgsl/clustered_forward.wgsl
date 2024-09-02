@@ -1,6 +1,6 @@
 #define_import_path bevy_pbr::clustered_forward
 
-#import bevy_pbr::mesh_view_bindings as Bindings
+use bevy_pbr::mesh_view_bindings as Bindings
 
 // NOTE: Keep in sync with bevy_pbr/src/light.rs
 fn view_z_to_z_slice(view_z: f32, is_orthographic: bool) -> u32 {

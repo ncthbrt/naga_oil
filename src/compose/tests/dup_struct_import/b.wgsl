@@ -1,5 +1,5 @@
 #define_import_path b
-#import struct
+use struct
 
 pub fn b() -> struct::MyStruct {
     var s_b: struct::MyStruct;

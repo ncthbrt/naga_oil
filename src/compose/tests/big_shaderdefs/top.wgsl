@@ -1,4 +1,4 @@
-#import mod
+use mod
 
 pub fn main() -> f32 {
     return mod::f();

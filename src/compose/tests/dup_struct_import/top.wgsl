@@ -1,5 +1,5 @@
-#import a
-#import b
+use a
+use b
 
 pub fn main() -> f32 {
     let a = a::a();

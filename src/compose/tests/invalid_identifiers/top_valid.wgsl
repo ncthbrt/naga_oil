@@ -1,8 +1,8 @@
-#import consts
-#import fns
-#import globals
-// #import struct_members
-#import structs
+use consts
+use fns
+use globals
+// use struct_members
+use structs
 
 pub fn main() -> f32 {
     let a = consts::fine + consts::bad_;

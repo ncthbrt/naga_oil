@@ -1,6 +1,6 @@
 #define_import_path a
 
-#import consts
+use consts
 
 pub fn f() -> f32 {
     return consts::PI * 1.0;

@@ -1,4 +1,4 @@
-#import mod Frag, fragment
+use mod Frag, fragment
 
 @fragment
 pub fn main() -> @location(0) f32 {

@@ -62,14 +62,8 @@ impl<'a> DerivedModule<'a> {
         }
     }
 
-    // remap a type from source context into our derived context
-    pub fn import_type(&mut self, h_type: &Handle<Type>) -> Handle<Type> {
-        self.rename_type(h_type, None)
-    }
-
     pub fn import_entrypoint(&mut self, entrypoint: &EntryPoint) {
         let mapped_func = self.localize_function(&entrypoint.function);
-
         self.entrypoints.push(EntryPoint {
             name: entrypoint.name.clone(),
             stage: entrypoint.stage,
@@ -77,6 +71,11 @@ impl<'a> DerivedModule<'a> {
             workgroup_size: entrypoint.workgroup_size,
             function: mapped_func,
         })
+    }
+
+    // remap a type from source context into our derived context
+    pub fn import_type(&mut self, h_type: &Handle<Type>) -> Handle<Type> {
+        self.rename_type(h_type, None)
     }
 
     // remap a type from source context into our derived context, and rename it
@@ -144,8 +143,8 @@ impl<'a> DerivedModule<'a> {
             new_h
         })
     }
-    // remap a const from source context into our derived context, and rename it
 
+    // remap a const from source context into our derived context, and rename it
     pub fn rename_const(
         &mut self,
         h_const: &Handle<Constant>,

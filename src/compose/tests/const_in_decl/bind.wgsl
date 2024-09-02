@@ -1,6 +1,6 @@
 #define_import_path bind
 
-#import consts
+use consts
 
 pub const y: u32 = 2u;
 

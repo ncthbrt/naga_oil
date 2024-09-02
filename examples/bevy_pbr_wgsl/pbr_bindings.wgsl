@@ -1,6 +1,6 @@
 #define_import_path bevy_pbr::pbr_bindings
 
-#import bevy_pbr::pbr_types as Types
+use bevy_pbr::pbr_types as Types
 
 @group(1) @binding(0)
 var<uniform> material: Types::StandardMaterial;

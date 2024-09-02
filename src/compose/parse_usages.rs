@@ -18,14 +18,13 @@ pub fn parse_uses(
     declared_usages: &mut IndexMap<String, Vec<(String, Option<Visibility>, UseBehaviour)>>,
     declared_wildcard_usages: &mut IndexSet<(String, Option<Visibility>)>,
     declared_extensions: &mut IndexSet<String>,
-    declared_patchsets: &mut IndexSet<String>,
 ) -> Result<(), UsageFault> {
     let mut tokens = Tokenizer::new(input, false).peekable();
 
     let use_behaviour = match tokens.peek() {
         Some(Token::Other('#', _)) => {
             tokens.next();
-            UseBehaviour::Legacy
+            UseBehaviour::ModuleSystem
         }
         _ => UseBehaviour::ModuleSystem,
     };
@@ -39,10 +38,8 @@ pub fn parse_uses(
     };
 
     let mut extension_import = false;
-    let mut patchset_import = false;
 
     match tokens.next() {
-        Some(Token::Identifier("import", _)) if use_behaviour == UseBehaviour::Legacy => (),
         Some(Token::Identifier("use", _)) => (),
         Some(Token::Identifier("extend", pos)) if visibility == Some(Visibility::Public) => {
             return Err(UsageFault::UsageParseErrorWithOffset(
@@ -65,20 +62,6 @@ pub fn parse_uses(
                 input.len(),
             ))
         }
-    };
-
-    match tokens.peek() {
-        Some(Token::Identifier("patchset", pos)) if extension_import => {
-            return Err(UsageFault::UsageParseErrorWithOffset("`extend` does not support the `patchset` keyword".to_string(), *pos))
-        }
-        Some(Token::Identifier("patchset", pos)) if use_behaviour == UseBehaviour::Legacy => {
-            return Err(UsageFault::UsageParseErrorWithOffset("#import does not support the `patchset` keyword. It implicitly imports and applies patches".to_string(), *pos))
-        }
-        Some(Token::Identifier("patchset", _)) => {
-            tokens.next();
-            patchset_import = true;
-        }
-        _ => (),
     };
 
     let mut stack = Vec::default();
@@ -128,12 +111,6 @@ pub fn parse_uses(
                             pos,
                         ));
                     }
-                    if patchset_import {
-                        return Err(UsageFault::UsageParseErrorWithOffset(
-                            "`use patchset` does not support aliasing using `as`".to_string(),
-                            pos,
-                        ));
-                    }
                     let Some(Token::Identifier(name, _)) = tokens.next() else {
                         return Err(UsageFault::UsageParseErrorWithOffset(
                             "expected identifier after `as`".to_string(),
@@ -151,7 +128,7 @@ pub fn parse_uses(
                         tokens.next();
                     }
                 }
-                // support deprecated #import mod item
+                // support deprecated use mod item
                 else if let Some(Token::Identifier(..)) = tokens.peek() {
                     #[cfg(not(feature = "allow_deprecated"))]
                     tracing::warn!("item list imports are deprecated, please use `rust::style::item_imports` (or use feature `allow_deprecated`)`\n| {}", input);
@@ -191,14 +168,6 @@ pub fn parse_uses(
                     if extension_import {
                         let full_path = format!("{}{}", stack.join(""), current);
                         declared_extensions.insert(full_path);
-                    } else if patchset_import {
-                        let full_path = format!("{}{}", stack.join(""), current);
-                        declared_usages.entry(used_name.clone()).or_default().push((
-                            full_path.clone(),
-                            visibility,
-                            use_behaviour.clone(),
-                        ));
-                        declared_patchsets.insert(full_path);
                     } else {
                         let full_path = format!("{}{}", stack.join(""), current);
                         declared_usages.entry(used_name.clone()).or_default().push((
@@ -747,8 +716,7 @@ fn test_parse(
     let mut declared_imports = IndexMap::default();
     let mut declared_extensions = IndexSet::default();
     let mut declared_wildcard_usages = IndexSet::default();
-    let mut declared_patches = IndexSet::default();
-    let mut submodules = IndexSet::default();
+    let submodules = IndexSet::default();
 
     parse_uses(
         input,
@@ -758,7 +726,6 @@ fn test_parse(
         &mut declared_imports,
         &mut declared_wildcard_usages,
         &mut declared_extensions,
-        &mut declared_patches,
     )
     .map_err(|err| match err {
         UsageFault::UsageParseError(err) => ComposerErrorInner::UsageParseError(err, 0).to_string(),
@@ -773,29 +740,29 @@ fn test_parse(
 #[test]
 fn import_tokens() {
     let input = r"
-        #import a::b
+        use a::b
     ";
     assert_eq!(
         test_parse(input),
         Ok(IndexMap::from_iter([(
             "b".to_owned(),
-            vec!(("a::b".to_owned(), None, UseBehaviour::Legacy))
+            vec!(("a::b".to_owned(), None, UseBehaviour::ModuleSystem))
         )]))
     );
 
     let input = r"
-        #import a::{b, c}
+        use a::{b, c}
     ";
     assert_eq!(
         test_parse(input),
         Ok(IndexMap::from_iter([
             (
                 "b".to_owned(),
-                vec!(("a::b".to_owned(), None, UseBehaviour::Legacy))
+                vec!(("a::b".to_owned(), None, UseBehaviour::ModuleSystem))
             ),
             (
                 "c".to_owned(),
-                vec!(("a::c".to_owned(), None, UseBehaviour::Legacy))
+                vec!(("a::c".to_owned(), None, UseBehaviour::ModuleSystem))
             ),
         ]))
     );
@@ -826,22 +793,22 @@ fn import_tokens() {
     );
 
     let input = r"
-        #import a::{b::{c, d}, e}
+        use a::{b::{c, d}, e}
     ";
     assert_eq!(
         test_parse(input),
         Ok(IndexMap::from_iter([
             (
                 "c".to_owned(),
-                vec!(("a::b::c".to_owned(), None, UseBehaviour::Legacy))
+                vec!(("a::b::c".to_owned(), None, UseBehaviour::ModuleSystem))
             ),
             (
                 "d".to_owned(),
-                vec!(("a::b::d".to_owned(), None, UseBehaviour::Legacy))
+                vec!(("a::b::d".to_owned(), None, UseBehaviour::ModuleSystem))
             ),
             (
                 "e".to_owned(),
-                vec!(("a::e".to_owned(), None, UseBehaviour::Legacy))
+                vec!(("a::e".to_owned(), None, UseBehaviour::ModuleSystem))
             ),
         ]))
     );
@@ -868,47 +835,47 @@ fn import_tokens() {
     );
 
     let input = r"
-        #import a, b
+        use a, b
     ";
     assert_eq!(
         test_parse(input),
         Ok(IndexMap::from_iter([
             (
                 "a".to_owned(),
-                vec!(("a".to_owned(), None, UseBehaviour::Legacy))
+                vec!(("a".to_owned(), None, UseBehaviour::ModuleSystem))
             ),
             (
                 "b".to_owned(),
-                vec!(("b".to_owned(), None, UseBehaviour::Legacy))
+                vec!(("b".to_owned(), None, UseBehaviour::ModuleSystem))
             ),
         ]))
     );
 
     let input = r"
-        #import a::b c, d
+        use a::b c, d
     ";
     assert_eq!(
         test_parse(input),
         Ok(IndexMap::from_iter([
             (
                 "c".to_owned(),
-                vec!(("a::b::c".to_owned(), None, UseBehaviour::Legacy))
+                vec!(("a::b::c".to_owned(), None, UseBehaviour::ModuleSystem))
             ),
             (
                 "d".to_owned(),
-                vec!(("a::b::d".to_owned(), None, UseBehaviour::Legacy))
+                vec!(("a::b::d".to_owned(), None, UseBehaviour::ModuleSystem))
             ),
         ]))
     );
 
     let input = r"
-        #import a::b c
+        use a::b c
     ";
     assert_eq!(
         test_parse(input),
         Ok(IndexMap::from_iter([(
             "c".to_owned(),
-            vec!(("a::b::c".to_owned(), None, UseBehaviour::Legacy))
+            vec!(("a::b::c".to_owned(), None, UseBehaviour::ModuleSystem))
         ),]))
     );
 
@@ -942,7 +909,7 @@ fn import_tokens() {
     );
 
     let input = r"
-        #import a::b::{
+        use a::b::{
             c::{d, e},
             f,
             g::{
@@ -956,23 +923,27 @@ fn import_tokens() {
         Ok(IndexMap::from_iter([
             (
                 "d".to_owned(),
-                vec!(("a::b::c::d".to_owned(), None, UseBehaviour::Legacy))
+                vec!(("a::b::c::d".to_owned(), None, UseBehaviour::ModuleSystem))
             ),
             (
                 "e".to_owned(),
-                vec!(("a::b::c::e".to_owned(), None, UseBehaviour::Legacy))
+                vec!(("a::b::c::e".to_owned(), None, UseBehaviour::ModuleSystem))
             ),
             (
                 "f".to_owned(),
-                vec!(("a::b::f".to_owned(), None, UseBehaviour::Legacy))
+                vec!(("a::b::f".to_owned(), None, UseBehaviour::ModuleSystem))
             ),
             (
                 "i".to_owned(),
-                vec!(("a::b::g::h".to_owned(), None, UseBehaviour::Legacy))
+                vec!(("a::b::g::h".to_owned(), None, UseBehaviour::ModuleSystem))
             ),
             (
                 "m".to_owned(),
-                vec!(("a::b::g::j::k::l".to_owned(), None, UseBehaviour::Legacy))
+                vec!((
+                    "a::b::g::j::k::l".to_owned(),
+                    None,
+                    UseBehaviour::ModuleSystem
+                ))
             ),
         ]))
     );
@@ -1003,27 +974,27 @@ fn import_tokens() {
     );
 
     let input = r"
-        #import a::b::{
+        use a::b::{
     ";
     assert!(test_parse(input).is_err());
 
     let input = r"
-        #import a::b::{{c}
+        use a::b::{{c}
     ";
     assert!(test_parse(input).is_err());
 
     let input = r"
-        #import a::b::{c}}
+        use a::b::{c}}
     ";
     assert!(test_parse(input).is_err());
 
     let input = r"
-        #import a::b{{c,d}}
+        use a::b{{c,d}}
     ";
     assert!(test_parse(input).is_err());
 
     let input = r"
-        #import a:b
+        use a:b
     ";
     assert!(test_parse(input).is_err());
 }

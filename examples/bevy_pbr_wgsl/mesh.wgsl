@@ -1,8 +1,8 @@
-#import bevy_pbr::mesh_view_bindings
-#import bevy_pbr::mesh_bindings
+use bevy_pbr::mesh_view_bindings
+use bevy_pbr::mesh_bindings
 
 // NOTE: Bindings must come before functions that use them!
-#import bevy_pbr::mesh_functions
+use bevy_pbr::mesh_functions
 
 struct Vertex {
     @location(0) position: vec3<f32>,
@@ -24,7 +24,7 @@ struct Vertex {
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
-    #import bevy_pbr::mesh_vertex_output
+    use bevy_pbr::mesh_vertex_output
 };
 
 @vertex
@@ -54,7 +54,7 @@ fn vertex(vertex: Vertex) -> VertexOutput {
 
 struct FragmentInput {
     @builtin(front_facing) is_front: bool,
-    #import bevy_pbr::mesh_vertex_output
+    use bevy_pbr::mesh_vertex_output
 };
 
 @fragment

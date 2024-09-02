@@ -1,7 +1,7 @@
 #define_import_path bevy_pbr::lighting
 
-#import bevy_pbr::utils as Utils
-#import bevy_pbr::mesh_view_types as ViewTypes
+use bevy_pbr::utils as Utils
+use bevy_pbr::mesh_view_types as ViewTypes
 
 // From the Filament design doc
 // https://google.github.io/filament/Filament.html#table_symbols

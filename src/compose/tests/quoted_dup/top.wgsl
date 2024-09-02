@@ -1,4 +1,4 @@
-#import "quoted_module" as foo;
+use "quoted_module" as foo;
 
 pub fn myfunc(foo: u32) -> f32 {
     return f32(foo) * 2.0;

@@ -1,5 +1,5 @@
-#import bevy_pbr::mesh_types
-#import bevy_pbr::mesh_view_bindings
+use bevy_pbr::mesh_types
+use bevy_pbr::mesh_view_bindings
 
 @group(1) @binding(0)
 var<uniform> mesh: Mesh;
@@ -7,11 +7,11 @@ var<uniform> mesh: Mesh;
 #ifdef SKINNED
 @group(1) @binding(1)
 var<uniform> joint_matrices: SkinnedMesh;
-#import bevy_pbr::skinning
+use bevy_pbr::skinning
 #endif
 
 // NOTE: Bindings must come before functions that use them!
-#import bevy_pbr::mesh_functions
+use bevy_pbr::mesh_functions
 
 struct Vertex {
     @location(0) position: vec3<f32>,

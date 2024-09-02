@@ -1,6 +1,6 @@
 #version 450
 
-#import common
+use common
 
 out vec4 out_color;
 

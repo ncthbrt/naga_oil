@@ -36,11 +36,11 @@ fn my_func() -> f32 {
 
 alternatively the module name can be specified as an argument to `Composer::add_composable_module`.
 
-shaders can then import the module with an `#import` directive (with an optional `as` name) :
+shaders can then import the module with an `use` directive (with an optional `as` name) :
 
 ```wgsl
-#import my_module;
-#import my_other_module as mod2;
+use my_module;
+use my_other_module as mod2;
 
 fn main() -> f32 {
     let x = my_module::my_func();
@@ -52,7 +52,7 @@ fn main() -> f32 {
 or import a comma-separated list of individual items :
 
 ```wgsl
-#import my_module::{my_func, my_const}
+use my_module::{my_func, my_const}
 
 fn main() -> f32 {
     return my_func(my_const);
@@ -62,7 +62,7 @@ fn main() -> f32 {
 Some rust-style import syntax is supported, and items can be directly imported using the fully qualified item name :
 
 ```wgsl
-#import my_package::{
+use my_package::{
     first_module::{item_one as item, item_two},
     second_module::submodule,
 }
@@ -74,63 +74,12 @@ fn main() -> f32 {
 
 `module::self` and `module::*` are not currently supported.
 
-imports can be nested - modules may import other modules, but not recursively. when a new module is added, all its `#import`s must already have been added.
+imports can be nested - modules may import other modules, but not recursively. when a new module is added, all its `use`s must already have been added.
 the same module can be imported multiple times by different modules in the import tree.
 there is no overlap of namespaces, so the same function names (or type, constant, or variable names) may be used in different modules.
 
 note: the final shader will include the required dependencies (bindings, globals, consts, other functions) of any imported items that are used, but will not include the rest of the imported module.
 
-## overriding functions
-
-virtual functions can be declared with the `virtual` keyword:
-
-```glsl
-    pub virtual fn point_light(world_position: vec3<f32>) -> vec3<f32> { ... }
-```
-
-virtual functions defined in imported modules can then be overridden using the `patch` keyword:
-
-```wgsl
-use bevy_pbr::lighting as Lighting;
-
-patch fn Lighting::point_light (world_position: vec3<f32>) -> vec3<f32> {
-    let original = Lighting::point_light(world_position);
-    let quantized = vec3<u32>(original * 3.0);
-    return vec3<f32>(quantized) / 3.0;
-}
-```
-
-patches must either be declared in the top-level shader using `use patchset module_name;`, or the module containing the patch must be imported as an `additional_patchset` in a `Composer::add_composable_module` or `Composer::make_naga_module` call. Using `use patchset` to import a module with patches will not work due to tree-shaking.
-
-patch function definitions cause _all_ calls to the original function in the entire shader scope to be replaced by calls to the new function, with the exception of calls within the patch function itself.
-
-the function signature of the patch must match the base function.
-
-patches can be specified at any point in the final shader's import tree.
-
-multiple patches can be applied to the same function. for example, given :
-
-- a module `a` containing a function `f`,
-- a module `b` that uses `a`, and containing an `patch a::f` function,
-- a module `c` that imports `a` and `b`, and containing an `patch a::f` function,
-
-then `b` and `c` both specify an patch for `a::f`.
-
-the `patch fn a::f` declared in module `b` may call to `a::f` within its body.
-
-the `patch fn a::f` declared in module `c` may call to `a::f` within its body, but the call will be redirected to `b::f`.
-
-any other calls to `a::f` (within modules `a` or `b`, or anywhere else) will end up redirected to `c::f`.
-
-in this way a chain or stack of patches can be applied.
-
-different patches of the same function can be specified in different import branches. the final stack will be ordered based on the first occurrence of the patches in the import tree (using a depth first search).
-
-note that imports into a module/shader are processed in order, but are processed before the body of the current shader/module regardless of where they occur in that module, so there is no way to import a module containing a patch and inject a call into the patch stack prior to that imported patch. you can instead create two modules each containing a patch and import them into a parent module/shader to order them as required.
-
-patch functions can currently only be defined in wgsl.
-
-if the `patch_any` crate feature is enabled, then the `virtual` keyword is not required for the function being overridden.
 
 ## languages
 

@@ -68,6 +68,8 @@ pub enum ComposerErrorInner {
     CrateNotFound(String),
     #[error("required module item '{0}::{1}' not found")]
     ModuleItemNotFound(String, String, usize),
+    #[error("required extension '{0}' not found")]
+    ExtensionNotFound(String, usize),
     #[error("{0}")]
     WgslParseError(naga::front::wgsl::ParseError),
     #[cfg(feature = "glsl")]
@@ -111,12 +113,6 @@ pub enum ComposerErrorInner {
     DecorationInSource(Range<usize>),
     #[error("naga oil only supports glsl 440 and 450")]
     GlslInvalidVersion(usize),
-    #[error("invalid patch :{0}")]
-    RedirectError(#[from] RedirectError),
-    #[error(
-        "patch is invalid as `{name}` is not virtual (this error can be disabled with feature 'patch_any')"
-    )]
-    PatchNotVirtual { name: String, pos: usize },
     #[error("virtual function is invalid as `{name}` is not public")]
     VirtualFunctionNotPublic { name: String, pos: usize },
     #[error(
@@ -214,6 +210,10 @@ impl ComposerError {
                 vec![Label::primary((), *pos..*pos)],
                 vec![format!("missing or private import item '{msg}::{item}'")],
             ),
+            ComposerErrorInner::ExtensionNotFound(msg, pos) => (
+                vec![Label::primary((), *pos..*pos)],
+                vec![format!("missing extension '{msg}'")],
+            ),
             ComposerErrorInner::UsageParseError(msg, pos) => (
                 vec![Label::primary((), *pos..*pos)],
                 vec![format!("invalid import spec: '{msg}'")],
@@ -244,7 +244,6 @@ impl ComposerError {
             | ComposerErrorInner::UnknownShaderDef { pos, .. }
             | ComposerErrorInner::UnknownShaderDefOperator { pos, .. }
             | ComposerErrorInner::InvalidShaderDefComparisonValue { pos, .. }
-            | ComposerErrorInner::PatchNotVirtual { pos, .. }
             | ComposerErrorInner::VirtualFunctionNotPublic { pos, .. }
             | ComposerErrorInner::GlslInvalidVersion(pos)
             | ComposerErrorInner::DefineInModule(pos)
@@ -260,9 +259,6 @@ impl ComposerError {
             }
             ComposerErrorInner::InconsistentShaderDefValue { def } => {
                 return format!("{path}: multiple inconsistent shader def values: '{def}'");
-            }
-            ComposerErrorInner::RedirectError(..) => {
-                (vec![Label::primary((), 0..0)], vec![format!("patch error")])
             }
             ComposerErrorInner::NoModuleName => {
                 return format!(

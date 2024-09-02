@@ -168,32 +168,32 @@ not commented
         ),
         ("*/", "*/"),
         (
-            r#"#import "embedded://file.wgsl""#,
-            r#"#import "embedded://file.wgsl""#,
+            r#"use "embedded://file.wgsl""#,
+            r#"use "embedded://file.wgsl""#,
         ),
         (
-            r#"// #import "embedded://file.wgsl""#,
-            r#"                                 "#,
+            r#"// use "embedded://file.wgsl""#,
+            r#"                             "#,
         ),
         (
-            r#"/* #import "embedded://file.wgsl" */"#,
-            r#"                                    "#,
+            r#"/* use "embedded://file.wgsl" */"#,
+            r#"                                "#,
         ),
         (
-            r#"/* #import "embedded:*/file.wgsl" */"#,
-            r#"                       file.wgsl" */"#,
+            r#"/* use "embedded:*/file.wgsl" */"#,
+            r#"                   file.wgsl" */"#,
         ),
         (
-            r#"#import "embedded://file.wgsl" // comment"#,
-            r#"#import "embedded://file.wgsl"           "#,
+            r#"use "embedded://file.wgsl" // comment"#,
+            r#"use "embedded://file.wgsl"           "#,
         ),
         (
-            r#"#import "embedded:/* */ /* /**/* / / /// * / //*/*/ / */*file.wgsl""#,
-            r#"#import "embedded:/* */ /* /**/* / / /// * / //*/*/ / */*file.wgsl""#,
+            r#"use "embedded:/* */ /* /**/* / / /// * / //*/*/ / */*file.wgsl""#,
+            r#"use "embedded:/* */ /* /**/* / / /// * / //*/*/ / */*file.wgsl""#,
         ),
     ];
 
-    for &(input, expected) in PARTIAL_TESTS.iter() {
+    for (idx, &(input, expected)) in PARTIAL_TESTS.iter().enumerate() {
         let mut nasty_processed = input.lines();
         let nasty_processed = nasty_processed.replace_comments().next().unwrap();
         assert_eq!(&nasty_processed, expected);

@@ -1,4 +1,4 @@
-use patchset test_module;
+use test_module;
 
 @group(0) @binding(0)
 pub var<storage, read_write> buffer: f32;

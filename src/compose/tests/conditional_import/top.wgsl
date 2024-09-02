@@ -1,7 +1,7 @@
 #ifdef USE_A
-    #import a C
+    use a C
 #else
-    #import b C
+    use b C
 #endif
 
 pub fn main() -> u32 {

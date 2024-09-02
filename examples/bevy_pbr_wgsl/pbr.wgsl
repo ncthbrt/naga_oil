@@ -1,8 +1,8 @@
-#import bevy_pbr::mesh_vertex_output as OutputTypes
-#import bevy_pbr::pbr_functions as PbrCore
-#import bevy_pbr::pbr_bindings as MaterialBindings
-#import bevy_pbr::pbr_types as PbrTypes
-#import bevy_pbr::mesh_view_bindings as ViewBindings
+use bevy_pbr::mesh_vertex_output as OutputTypes
+use bevy_pbr::pbr_functions as PbrCore
+use bevy_pbr::pbr_bindings as MaterialBindings
+use bevy_pbr::pbr_types as PbrTypes
+use bevy_pbr::mesh_view_bindings as ViewBindings
 
 @fragment
 fn fragment(
